@@ -31,3 +31,10 @@ body {
 #root {
   min-height: 100svh;
 }
+
+html[data-theme="light"],
+html[data-theme="light"] body {
+  background: #eaf0f7;
+  color: #172840;
+  color-scheme: light;
+}

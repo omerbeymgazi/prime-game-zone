@@ -1,0 +1,101 @@
+.admin-payment-accounts {
+  display: grid;
+  gap: 14px;
+  margin: 0 0 22px;
+  padding: 20px;
+  border: 1px solid rgba(0, 183, 255, .2);
+  border-radius: 15px;
+  background: rgba(0, 125, 201, .055);
+}
+
+.admin-payment-accounts .admin-section-heading {
+  margin: 0;
+}
+
+.admin-payment-account-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.admin-payment-account {
+  display: grid;
+  gap: 12px;
+  padding: 15px;
+  border: 1px solid rgba(132, 169, 206, .15);
+  border-radius: 12px;
+  background: rgba(4, 10, 18, .4);
+}
+
+.admin-payment-account > strong {
+  color: #8cdefe;
+  font-size: 13px;
+}
+
+.admin-payment-account label,
+.admin-rejection-reason {
+  display: grid;
+  gap: 6px;
+  color: #9eb0c5;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.admin-payment-account input,
+.admin-rejection-reason textarea {
+  width: 100%;
+  min-height: 40px;
+  padding: 9px 10px;
+  border: 1px solid rgba(139, 166, 197, .2);
+  border-radius: 8px;
+  outline: none;
+  background: #09111d;
+  color: #edf6ff;
+  font: inherit;
+}
+
+.admin-rejection-reason {
+  margin-top: 14px;
+}
+
+.admin-rejection-reason textarea {
+  resize: vertical;
+}
+
+.admin-payment-members {
+  display: grid;
+  gap: 7px;
+  margin: 12px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.admin-payment-members li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: rgba(112, 147, 184, .08);
+  color: #d8e6f4;
+  font-size: 11px;
+}
+
+.admin-payment-members li span {
+  color: #93a7bd;
+  text-align: right;
+}
+
+@media (max-width: 640px) {
+  .admin-payment-account-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-payment-members li {
+    flex-direction: column;
+  }
+
+  .admin-payment-members li span {
+    text-align: left;
+  }
+}

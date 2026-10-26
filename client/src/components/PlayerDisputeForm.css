@@ -1,0 +1,100 @@
+.player-dispute-panel {
+  margin-top: 22px;
+  padding: 20px;
+  border: 1px solid rgba(82, 153, 212, .2);
+  border-radius: 18px;
+  background: linear-gradient(145deg, rgba(10, 29, 49, .72), rgba(7, 13, 23, .94));
+}
+
+.player-dispute-panel h3 {
+  margin: 7px 0;
+  font-size: 20px;
+}
+
+.player-dispute-panel > p {
+  color: #9aabc1;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.player-dispute-panel form,
+.player-dispute-panel form label {
+  display: grid;
+  gap: 9px;
+}
+
+.player-dispute-panel form {
+  gap: 13px;
+}
+
+.player-dispute-panel form label {
+  color: #b9c7d9;
+  font-size: 12px;
+}
+
+.player-dispute-panel select,
+.player-dispute-panel textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 11px;
+  border: 1px solid rgba(132, 162, 201, .23);
+  border-radius: 11px;
+  background: #080e19;
+  color: #f3f7ff;
+  font: inherit;
+}
+
+.player-dispute-panel textarea {
+  resize: vertical;
+}
+
+.player-dispute-file small {
+  color: #8294ab;
+}
+
+.player-dispute-file input {
+  font: inherit;
+  font-size: 11px;
+}
+
+.player-dispute-file-ready,
+.player-dispute-notice {
+  color: #6be7a6 !important;
+}
+
+.player-dispute-empty {
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(112, 139, 171, .08);
+}
+
+.player-dispute-history {
+  display: grid;
+  gap: 9px;
+  margin-top: 20px;
+}
+
+.player-dispute-history > article {
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(112, 139, 171, .08);
+}
+
+.player-dispute-history > article span {
+  color: #85ceff;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: capitalize;
+}
+
+.player-dispute-history > article p {
+  margin: 6px 0;
+  color: #d2dcec;
+  font-size: 13px;
+  white-space: pre-wrap;
+}
+
+.player-dispute-history > article small {
+  color: #98abc2;
+  line-height: 1.5;
+}

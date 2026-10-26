@@ -4,7 +4,8 @@
   "description": "PRIME GAMING Backend Server",
   "main": "server.js",
   "scripts": {
-    "build": "node --check server.js && node --check admin-api.js",
+    "build": "node --check server.js && node --check admin-api.js && node --check db.js && node --check mysql-store.js",
+    "test": "node --test",
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
@@ -15,7 +16,8 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "mongoose": "^8.3.1",
+    "mysql2": "^3.24.6",
+    "qrcode": "^1.5.4",
     "telegraf": "^4.16.3"
   },
   "devDependencies": {

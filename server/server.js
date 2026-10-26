@@ -1,27 +1,34 @@
-require('dotenv').config();
-
+const path = require('path');
 const dns = require('dns');
 const https = require('https');
 const express = require('express');
 const cors = require('cors');
-const mongoose = require('mongoose');
-const path = require('path');
 const { Telegraf } = require('telegraf');
-const { createAdminRouter } = require('./admin-api');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
-// Node 18+ Happy Eyeballs often tries Telegram's IPv6 first; that path
-// commonly resets (ECONNRESET) even when IPv4 works.
+const {
+    createAdminRouter,
+    linkTelegramUsername,
+    sendMatchDayReminders,
+    setTelegramMessenger,
+    setTelegramPassMessenger,
+} = require('./admin-api');
+const { closeDatabase, getPool, initializeDatabase } = require('./db');
+
+// Node 18+ Happy Eyeballs setup for Telegram IPv4 preference
 dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
 const allowedOrigins = [
-    ...(process.env.CLIENT_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173').split(','),
-    process.env.RENDER_EXTERNAL_URL,
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    ...(process.env.CLIENT_ORIGIN || '').split(','),
     process.env.WEB_APP_URL,
 ]
     .flatMap((origin) => (origin || '').split(','))
     .map((origin) => origin.trim().replace(/\/+$/, ''))
     .filter(Boolean);
+
 app.use(cors({
     origin(origin, callback) {
         if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
@@ -29,6 +36,7 @@ app.use(cors({
     },
     credentials: true,
 }));
+
 app.use(express.json({ limit: '8mb' }));
 app.use('/api', createAdminRouter());
 
@@ -36,21 +44,20 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PORT = process.env.PORT || 5000;
 const configuredWebAppUrl = (
     process.env.WEB_APP_URL
-    || (process.env.NODE_ENV === 'production' ? process.env.RENDER_EXTERNAL_URL : '')
     || ''
 ).trim();
+
 const TELEGRAM_TOKEN_PATTERN = /^\d+:[A-Za-z0-9_-]{20,}$/;
 let botStatus = TELEGRAM_BOT_TOKEN ? 'starting' : 'not_configured';
 let webAppUrl = null;
 let webAppStatus = 'not_configured';
-let databaseError = '';
+let reminderTimer = null;
 
 if (configuredWebAppUrl) {
     try {
         const parsedWebAppUrl = new URL(configuredWebAppUrl);
         if (parsedWebAppUrl.protocol === 'https:'
             && parsedWebAppUrl.hostname
-            && !['localhost', '127.0.0.1', '::1'].includes(parsedWebAppUrl.hostname)
             && !parsedWebAppUrl.username
             && !parsedWebAppUrl.password) {
             webAppUrl = parsedWebAppUrl.toString().replace(/\/+$/, '');
@@ -65,7 +72,7 @@ if (configuredWebAppUrl) {
 
 if (webAppStatus !== 'ready') {
     console.error(
-        '⚠️ Telegram Mini App button is disabled. Set WEB_APP_URL to a public HTTPS URL (for example, an HTTPS tunnel or production domain) in server/.env.'
+        '⚠️ Telegram Mini App button warning. Set WEB_APP_URL to a valid public HTTPS URL (such as your Ngrok URL) in server/.env.'
     );
 }
 
@@ -115,7 +122,7 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function createBot(token) {
+function createBot(token, miniAppUrl = webAppUrl) {
     const bot = new Telegraf(token, {
         telegram: {
             agent: telegramAgent,
@@ -131,21 +138,32 @@ function createBot(token) {
         );
     });
 
-    bot.start((ctx) => {
+    bot.start(async (ctx) => {
         const greeting = `ሰላም ${ctx.from.first_name}! እንኳን ወደ PRIME GAMING በሰላም መጡ! 🎮`;
-        if (!webAppUrl) {
+        let linked = false;
+        if (ctx.from.username) {
+            try {
+                linked = await linkTelegramUsername(ctx.from.username, ctx.chat.id);
+            } catch (error) {
+                console.error('Telegram account could not be linked:', error?.message || error);
+            }
+        }
+        const alerts = linked
+            ? '\n\nTelegram match and support alerts are now connected to your player account.'
+            : '\n\nTo connect alerts, add your Telegram username to your player profile, then send /start here.';
+        if (!miniAppUrl) {
             return ctx.reply(
-                `${greeting}\n\nየመተግበሪያው ሊንክ ለጊዜው አልተዘጋጀም። Please try again later.`
+                `${greeting}\n\nየመተግበሪያው ሊንክ ለጊዜው አልተዘጋጀም። Please try again later.${alerts}`
             );
         }
 
         return ctx.reply(
-            `${greeting}\n\nየውድድር መተግበሪያውን ለመክፈት ከታች ይጫኑ።`,
+            `${greeting}\n\nየውድድር መተግበሪያውን ለመክፈት ከታች ይጫኑ።${alerts}`,
             {
                 reply_markup: {
                     inline_keyboard: [[{
                         text: '🎮 Open PRIME GAMING App',
-                        web_app: { url: webAppUrl },
+                        web_app: { url: miniAppUrl },
                     }]],
                 },
             }
@@ -179,7 +197,7 @@ async function launchBotWithRetry(bot) {
             if (telegramErrorCode === 404) {
                 botStatus = 'invalid_token';
                 console.error(
-                    '❌ Telegram rejected the bot token (HTTP 404). Create or copy a current token from @BotFather, set TELEGRAM_BOT_TOKEN in server/.env, then restart the server.'
+                    '❌ Telegram rejected the bot token (HTTP 404). Check TELEGRAM_BOT_TOKEN in server/.env.'
                 );
                 return;
             }
@@ -190,15 +208,13 @@ async function launchBotWithRetry(bot) {
 
             if (!retryable) {
                 botStatus = 'unavailable';
-                console.error('❌ Bot launch failed with a non-retryable error. HTTP API will keep running.');
+                console.error('❌ Bot launch failed with a non-retryable error.');
                 return;
             }
 
             try {
                 bot.stop('retry');
-            } catch (_) {
-                // Not running yet (failed during getMe) — safe to ignore.
-            }
+            } catch (_) {}
 
             console.log(`⏳ Retrying Telegram connection in ${delay / 1000}s...`);
             botStatus = 'retrying';
@@ -208,105 +224,106 @@ async function launchBotWithRetry(bot) {
 }
 
 let bot = null;
+let databaseStatus = 'disconnected';
+let databaseRetryTimer = null;
+let databaseCheckInProgress = false;
 
-if (!TELEGRAM_BOT_TOKEN) {
-    botStatus = 'not_configured';
-    console.error('❌ Error: TELEGRAM_BOT_TOKEN is missing!');
-} else if (!TELEGRAM_TOKEN_PATTERN.test(TELEGRAM_BOT_TOKEN)) {
-    botStatus = 'invalid_token';
-    console.error(
-        '❌ TELEGRAM_BOT_TOKEN has an invalid format. Expected the BotFather token format "<bot-id>:<token>". The HTTP API will continue running; replace the value in server/.env and restart.'
-    );
-} else {
-    bot = createBot(TELEGRAM_BOT_TOKEN);
-    launchBotWithRetry(bot);
-
-    const stop = (signal) => {
-        try {
-            bot.stop(signal);
-        } catch (_) {
-            // Bot never finished launching.
+async function maintainDatabaseConnection() {
+    if (databaseCheckInProgress) return;
+    databaseCheckInProgress = true;
+    try {
+        if (databaseStatus === 'connected') {
+            try {
+                await getPool().query('SELECT 1');
+                return;
+            } catch (error) {
+                databaseStatus = 'unavailable';
+                console.error('MySQL health check failed; reconnecting:', error.message);
+                await closeDatabase();
+            }
         }
-    };
 
-    process.once('SIGINT', () => stop('SIGINT'));
-    process.once('SIGTERM', () => stop('SIGTERM'));
+        await initializeDatabase();
+        databaseStatus = 'connected';
+        sendMatchDayReminders().catch((error) => {
+            console.error('Match-day reminders could not be checked:', error?.message || error);
+        });
+    } catch (error) {
+        databaseStatus = 'unavailable';
+        console.error('MySQL connection failed; retrying automatically:', error.message);
+        try {
+            await closeDatabase();
+        } catch (closeError) {
+            console.error('Failed MySQL pool could not be closed:', closeError.message);
+        }
+    } finally {
+        databaseCheckInProgress = false;
+    }
 }
 
 app.get('/api/health', (req, res) => {
     res.json({
-        message: 'Welcome to PRIME GAMING API!',
+        message: 'Welcome to PRIME GAMING API (Local Mode)!',
         bot: bot && bot.botInfo ? { username: bot.botInfo.username, id: bot.botInfo.id } : null,
         botStatus,
         webAppStatus,
-        databaseStatus: ['disconnected', 'connected', 'connecting', 'disconnecting'][mongoose.connection.readyState]
-            || 'unknown',
-        databaseError,
+        databaseStatus,
     });
 });
 
-if (process.env.NODE_ENV === 'production') {
-    const clientDistPath = path.resolve(__dirname, '../client/dist');
-    app.use(express.static(clientDistPath));
-    app.get(/^(?!\/api(?:\/|$)).*/, (req, res, next) => {
-        if (!req.accepts('html')) return next();
-        return res.sendFile(path.join(clientDistPath, 'index.html'));
-    });
-}
-
-app.listen(PORT, () => {
-    console.log(`🚀 PRIME GAMING Server running on port ${PORT}`);
+app.use((error, req, res, next) => {
+    if (error.message === 'Request origin is not allowed.') {
+        return res.status(403).json({ error: error.message });
+    }
+    return next(error);
 });
 
-if (!process.env.MONGODB_URI) {
-    databaseError = 'MONGODB_URI is not configured.';
-    console.error('❌ MONGODB_URI is missing; registration and admin data endpoints are unavailable.');
-} else {
-    function describeMongoError(error) {
-        if (error?.code === 8000 || /authentication failed|bad auth/i.test(error?.message || '')) {
-            return 'MongoDB authentication failed. Check the Atlas database username/password, authentication database, and URL-encode special characters in the password.';
-        }
-        if (/ENOTFOUND|getaddrinfo/i.test(error?.message || '')) {
-            return 'MongoDB hostname could not be resolved. Check the Atlas cluster hostname and network/DNS access.';
-        }
-        if (/IP.*access list|not authorized|IP address/i.test(error?.message || '')) {
-            return 'MongoDB network access is blocked. Add this server IP to the Atlas Network Access list.';
-        }
-        return `${error?.name || 'MongoDB connection error'}: connection unavailable. Check Atlas network access and the connection string.`;
+async function startServer() {
+    const server = app.listen(PORT, () => {
+        console.log(`🚀 PRIME GAMING Local Server running on port ${PORT}`);
+    });
+
+    await maintainDatabaseConnection();
+    databaseRetryTimer = setInterval(maintainDatabaseConnection, 5000);
+    reminderTimer = setInterval(() => {
+        if (databaseStatus !== 'connected') return;
+        sendMatchDayReminders().catch((error) => {
+            console.error('Match-day reminders could not be checked:', error?.message || error);
+        });
+    }, 5 * 60 * 1000);
+
+    if (!TELEGRAM_BOT_TOKEN) {
+        botStatus = 'not_configured';
+        console.error('❌ Error: TELEGRAM_BOT_TOKEN is missing!');
+    } else if (!TELEGRAM_TOKEN_PATTERN.test(TELEGRAM_BOT_TOKEN)) {
+        botStatus = 'invalid_token';
+        console.error('❌ TELEGRAM_BOT_TOKEN has an invalid format.');
+    } else {
+        bot = createBot(TELEGRAM_BOT_TOKEN);
+        setTelegramMessenger((chatId, message) => bot.telegram.sendMessage(chatId, message));
+        setTelegramPassMessenger((chatId, image, caption) => (
+            bot.telegram.sendPhoto(chatId, { source: image }, { caption })
+        ));
+        launchBotWithRetry(bot);
     }
 
-    mongoose.connection.on('connected', () => {
-        databaseError = '';
-        console.log('✅ Tournament database connected.');
-    });
-    mongoose.connection.on('disconnected', () => {
-        console.error('⚠️ MongoDB disconnected; database-backed API routes will return 503 until reconnection.');
-    });
-    mongoose.connection.on('reconnected', () => {
-        databaseError = '';
-        console.log('✅ MongoDB connection restored.');
-    });
-    mongoose.connection.on('error', (error) => {
-        databaseError = describeMongoError(error);
-        console.error('❌ MongoDB connection error:', databaseError);
-    });
-
-    async function connectToMongoWithRetry() {
-        let attempt = 0;
-        while (mongoose.connection.readyState !== 1) {
-            attempt += 1;
+    const stop = async (signal) => {
+        if (bot) {
             try {
-                await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10_000 });
-                databaseError = '';
-                return;
-            } catch (error) {
-                databaseError = describeMongoError(error);
-                console.error(`❌ MongoDB connection attempt ${attempt} failed:`, databaseError);
-                const delay = Math.min(30_000, 2_000 * attempt);
-                await new Promise((resolve) => setTimeout(resolve, delay));
-            }
+                bot.stop(signal);
+            } catch (_) {}
         }
-    }
-
-    connectToMongoWithRetry();
+        if (reminderTimer) clearInterval(reminderTimer);
+        if (databaseRetryTimer) clearInterval(databaseRetryTimer);
+        server.close();
+        await closeDatabase();
+    };
+    process.once('SIGINT', () => stop('SIGINT'));
+    process.once('SIGTERM', () => stop('SIGTERM'));
 }
+
+if (require.main === module) {
+    startServer();
+}
+
+module.exports = { app, createBot, startServer };
