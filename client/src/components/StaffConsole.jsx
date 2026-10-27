@@ -1,18 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import './StaffConsole.css'
+import { apiRequest } from '../api.js'
 
 async function request(path, options = {}) {
-  const response = await fetch(`/api${path}`, {
-    credentials: 'include',
-    ...options,
-    headers: {
-      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...options.headers,
-    },
-  })
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`)
-  return data
+  return apiRequest(`/api${path}`, options)
 }
 
 function localDateTime(value) {

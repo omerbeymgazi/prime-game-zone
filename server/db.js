@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 
 const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
@@ -61,6 +62,39 @@ async function createApplicationTables(connection) {
         .filter(Boolean);
     for (const statement of statements) {
         await connection.query(statement);
+    }
+}
+
+async function backfillPaymentReceiptClaims(connection) {
+    const [registrations] = await connection.query('SELECT document FROM pgz_registrations');
+    for (const row of registrations) {
+        const registration = typeof row.document === 'string' ? JSON.parse(row.document) : row.document;
+        const match = typeof registration.receiptData === 'string'
+            ? registration.receiptData.match(/^data:image\/(?:png|jpeg|webp);base64,([A-Za-z0-9+/]+={0,2})$/)
+            : null;
+        if (!match) continue;
+        const receipt = Buffer.from(match[1], 'base64');
+        if (!receipt.length || receipt.length > 5 * 1024 * 1024) continue;
+        const receiptHash = crypto.createHash('sha256').update(receipt).digest('hex');
+        const claimKey = String(registration.paymentGroupId || registration._id || '');
+        if (!claimKey) continue;
+        await connection.execute(
+            'INSERT IGNORE INTO payment_receipt_claims (receipt_hash, claim_key, player_id) VALUES (?, ?, ?)',
+            [receiptHash, claimKey, registration.playerId ? String(registration.playerId) : null],
+        );
+    }
+
+    const [submissions] = await connection.query(
+        'SELECT group_id AS groupId, receipt_data AS receiptData FROM payment_submissions WHERE receipt_data IS NOT NULL',
+    );
+    for (const submission of submissions) {
+        const receipt = Buffer.from(submission.receiptData);
+        if (!receipt.length || receipt.length > 5 * 1024 * 1024) continue;
+        const receiptHash = crypto.createHash('sha256').update(receipt).digest('hex');
+        await connection.execute(
+            'INSERT IGNORE INTO payment_receipt_claims (receipt_hash, claim_key) VALUES (?, ?)',
+            [receiptHash, submission.groupId],
+        );
     }
 }
 
@@ -141,7 +175,7 @@ async function initializeDatabase() {
     const name = databaseName();
     const config = {
         host: process.env.MYSQL_HOST || 'localhost',
-        port: Number(process.env.MYSQL_PORT || process.env.DB_PORT || 3307),
+        port: Number(process.env.MYSQL_PORT || process.env.DB_PORT || 3306),
         user: process.env.MYSQL_USER || 'root',
         password: process.env.MYSQL_PASSWORD || '',
         waitForConnections: true,
@@ -167,6 +201,7 @@ async function initializeDatabase() {
         await databasePool.query('SELECT 1');
         await createCollectionTables(databasePool);
         await createApplicationTables(databasePool);
+        await backfillPaymentReceiptClaims(databasePool);
         await migrateChatSchema(databasePool);
         await migrateLocalJsonData(databasePool);
     } catch (error) {

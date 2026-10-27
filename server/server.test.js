@@ -35,12 +35,29 @@ test('health endpoint and CORS are available while XAMPP MySQL is not connected'
     }
 });
 
-test('registration rejects missing receipt, invalid Telegram username, and retired bank methods', async () => {
+test('Telegram webhook rejects updates without its configured secret', async () => {
+    const server = app.listen(0, '127.0.0.1');
+    try {
+        await new Promise((resolve) => server.once('listening', resolve));
+        const response = await fetch(`http://127.0.0.1:${server.address().port}/api/telegram/webhook`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ update_id: 1 }),
+        });
+        assert.equal(response.status, 401);
+    } finally {
+        await new Promise((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve());
+        });
+    }
+});
+
+test('individual registration requires an authenticated player session', async () => {
     const server = app.listen(0, '127.0.0.1');
     try {
         await new Promise((resolve) => server.once('listening', resolve));
         const url = `http://127.0.0.1:${server.address().port}/api/registrations`;
-        const submit = (body) => fetch(url, {
+        const response = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -49,26 +66,10 @@ test('registration rejects missing receipt, invalid Telegram username, and retir
                 telegramUsername: '@valid_name',
                 payment: 'cbe',
                 weekId: 0,
-                ...body,
             }),
         });
-
-        const missingReceipt = await submit({});
-        assert.equal(missingReceipt.status, 400);
-        assert.match((await missingReceipt.json()).error, /upload a payment receipt/i);
-
-        const invalidTelegram = await submit({
-            telegramUsername: 'invalid-handle',
-            receiptData: `data:image/png;base64,${Buffer.from('receipt').toString('base64')}`,
-        });
-        assert.equal(invalidTelegram.status, 400);
-        assert.match((await invalidTelegram.json()).error, /Telegram username/i);
-
-        const retiredBankMethod = await submit({
-            payment: 'abyssinia',
-            receiptData: `data:image/png;base64,${Buffer.from('receipt').toString('base64')}`,
-        });
-        assert.equal(retiredBankMethod.status, 400);
+        assert.equal(response.status, 401);
+        assert.match((await response.json()).error, /sign-in is required/i);
     } finally {
         await new Promise((resolve, reject) => {
             server.close((error) => error ? reject(error) : resolve());
@@ -360,9 +361,8 @@ test('chat, dispute, and finance routes enforce player or organizer sessions', a
     }
 });
 
-test('Telegram /start handler replies with the welcome message and configured Mini App button', async () => {
-    const miniAppUrl = 'https://emmaline-nasopharyngeal-variously.ngrok-free.dev';
-    const bot = createBot('123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi', miniAppUrl);
+test('Telegram /start handler replies with inline chat actions and no Web App button', async () => {
+    const bot = createBot('123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi');
     bot.botInfo = { id: 123456789, is_bot: true, first_name: 'Test', username: 'testbot' };
     let request;
     const telegramPrototype = Object.getPrototypeOf(bot.telegram);
@@ -388,6 +388,132 @@ test('Telegram /start handler replies with the welcome message and configured Mi
     }
 
     assert.equal(request.method, 'sendMessage');
-    assert.match(request.payload.text, /ሰላም Hana!/);
-    assert.equal(request.payload.reply_markup.inline_keyboard[0][0].web_app.url, miniAppUrl);
+    assert.match(request.payload.text, /🎮 እንኳን ወደ Prime Game Zone በደህና መጡ! 🏆/);
+    assert.match(request.payload.text, /\/tournaments.*\/register.*\/myregistrations.*\/help/s);
+    assert.equal(request.payload.reply_markup.inline_keyboard[0][0].callback_data, 'prime:register');
+    assert.equal(JSON.stringify(request.payload.reply_markup).includes('web_app'), false);
+});
+
+test('Telegram chat completes profile linking, tournament/payment selection, and screenshot registration', async () => {
+    let linked = false;
+    let submittedGroup = null;
+    let resubmittedPayment = null;
+    const sentMessages = [];
+    const rejectedRegistrationId = '0123456789abcdef01234567';
+    const bot = createBot('123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi', {
+        findTelegramPlayer: async () => linked ? {
+            id: 'player-1',
+            playerCode: 'PGZ001',
+            displayName: 'Hana Player',
+            contact: '0912345678',
+            telegramUsername: 'hana_player',
+        } : null,
+        registerTelegramPlayer: async () => {
+            linked = true;
+            return { id: 'player-1', playerCode: 'PGZ001' };
+        },
+        listTelegramTournaments: async () => [{
+            weekId: 2,
+            name: 'Prime Ethiopia Cup 3',
+            availableSlots: 8,
+            entryFee: 1500,
+        }],
+        getTelegramPaymentAccounts: async () => [
+            { type: 'cbe', number: '1000123456789' },
+            { type: 'telebirr', number: '0912345678' },
+        ],
+        listTelegramPlayerRegistrations: async () => [{
+            id: rejectedRegistrationId,
+            weekId: 2,
+            playerName: 'Hana Player',
+            paymentStatus: 'rejected',
+            rejectionReason: 'Receipt was unreadable.',
+            payment: 'telebirr',
+        }],
+        registerPlayersForTournament: async (checkout) => {
+            submittedGroup = checkout;
+            return {
+                registrations: checkout.participants.map((participant, index) => ({
+                    playerName: participant.playerName,
+                    confirmationCode: `PG-TEST${index + 1}`,
+                })),
+                tournament: { name: 'Prime Ethiopia Cup 3' },
+            };
+        },
+        resubmitPlayerPayment: async (checkout) => {
+            resubmittedPayment = checkout;
+            return { registrations: [] };
+        },
+        fetch: async () => ({ ok: true, arrayBuffer: async () => Buffer.from('receipt-image') }),
+    });
+    bot.botInfo = { id: 123456789, is_bot: true, first_name: 'Test', username: 'testbot' };
+    const telegramPrototype = Object.getPrototypeOf(bot.telegram);
+    const originalCallApi = telegramPrototype.callApi;
+    telegramPrototype.callApi = async function (method, payload) {
+        sentMessages.push({ method, payload });
+        return method === 'getFile'
+            ? { file_path: 'photos/receipt.jpg' }
+            : { message_id: sentMessages.length, date: 0, chat: { id: 42 } };
+    };
+
+    const from = { id: 42, is_bot: false, first_name: 'Hana', username: 'hana_player' };
+    let updateId = 10;
+    const message = (content) => ({
+        update_id: updateId++,
+        message: { message_id: updateId, from, chat: { id: 42, type: 'private' }, date: 0, ...content },
+    });
+    const callback = (data) => ({
+        update_id: updateId++,
+        callback_query: {
+            id: `callback-${updateId}`,
+            from,
+            message: { message_id: updateId, chat: { id: 42, type: 'private' } },
+            data,
+        },
+    });
+
+    try {
+        await bot.handleUpdate(message({ text: '/start', entities: [{ type: 'bot_command', offset: 0, length: 6 }] }));
+        await bot.handleUpdate(callback('prime:register'));
+        await bot.handleUpdate(message({
+            contact: { phone_number: '0912345678', user_id: 42 },
+        }));
+        await bot.handleUpdate(message({ text: 'Hana Player' }));
+        await bot.handleUpdate(callback('prime:register'));
+        await bot.handleUpdate(callback('prime:tournament:2'));
+        await bot.handleUpdate(callback('prime:payment:2:telebirr'));
+        await bot.handleUpdate(callback('prime:participant:self'));
+        await bot.handleUpdate(callback('prime:participant:add'));
+        await bot.handleUpdate(message({ text: 'Other Player' }));
+        await bot.handleUpdate(message({ text: '0923456789' }));
+        await bot.handleUpdate(message({ text: '@other_player' }));
+        await bot.handleUpdate(callback('prime:participants:continue'));
+        await bot.handleUpdate(message({
+            photo: [{ file_id: 'photo-small' }, { file_id: 'photo-large' }],
+        }));
+        await bot.handleUpdate(callback('prime:registrations'));
+        await bot.handleUpdate(callback(`prime:appeal:${rejectedRegistrationId}`));
+        await bot.handleUpdate(callback(`prime:appeal-payment:${rejectedRegistrationId}:cbe`));
+        await bot.handleUpdate(message({
+            photo: [{ file_id: 'appeal-small' }, { file_id: 'appeal-large' }],
+        }));
+    } finally {
+        telegramPrototype.callApi = originalCallApi;
+    }
+
+    assert.ok(sentMessages.some(({ payload }) => payload.reply_markup?.inline_keyboard?.flat().some((button) => button.callback_data === 'prime:register')));
+    assert.ok(sentMessages.some(({ payload }) => payload.reply_markup?.inline_keyboard?.flat().some((button) => /Add Another Player/.test(button.text || ''))));
+    assert.equal(sentMessages.some(({ payload }) => JSON.stringify(payload.reply_markup || {}).includes('web_app')), false);
+    assert.equal(submittedGroup.playerId, 'player-1');
+    assert.equal(submittedGroup.weekId, 2);
+    assert.equal(submittedGroup.payment, 'telebirr');
+    assert.equal(submittedGroup.participants.length, 2);
+    assert.equal(submittedGroup.participants[0].isAccountOwner, true);
+    assert.equal(submittedGroup.participants[1].playerName, 'Other Player');
+    assert.equal(submittedGroup.participants[1].contact, '0923456789');
+    assert.match(submittedGroup.receiptData, /^data:image\/jpeg;base64,/);
+    assert.equal(resubmittedPayment.playerId, 'player-1');
+    assert.equal(resubmittedPayment.registrationId, rejectedRegistrationId);
+    assert.equal(resubmittedPayment.payment, 'cbe');
+    assert.match(resubmittedPayment.receiptData, /^data:image\/jpeg;base64,/);
 });

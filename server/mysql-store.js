@@ -238,16 +238,23 @@ class MySqlModel {
 
     async withTransaction(callback) {
         const connection = await getPool().getConnection();
+        let discardConnection = false;
         try {
             await connection.beginTransaction();
             const result = await callback(connection);
             await connection.commit();
             return result;
         } catch (error) {
-            await connection.rollback();
+            try {
+                await connection.rollback();
+            } catch (rollbackError) {
+                discardConnection = true;
+                console.error('MySQL transaction rollback failed:', rollbackError?.message || rollbackError);
+            }
             throw error;
         } finally {
-            connection.release();
+            if (discardConnection) connection.destroy();
+            else connection.release();
         }
     }
 
@@ -298,10 +305,21 @@ class MySqlModel {
         return new MySqlDocument(this, document);
     }
 
-    async insertMany(values) {
-        const inserted = [];
-        for (const value of values) inserted.push(await this.create(value));
-        return inserted;
+    async insertMany(values, options = {}) {
+        if (!values.length) return [];
+        const connection = options.connection || getPool();
+        const documents = values.map((value) => this.prepare(value, true));
+        const rows = documents.map((document) => {
+            const [first, second, third] = this.uniqueValues(document);
+            return [String(document._id), JSON.stringify(document), first, second, third];
+        });
+        const placeholders = rows.map(() => '(?, ?, ?, ?, ?)').join(', ');
+        await connection.execute(
+            `INSERT INTO \`${this.tableName}\` (id, document, unique_1, unique_2, unique_3)
+             VALUES ${placeholders}`,
+            rows.flat(),
+        );
+        return documents.map((document) => new MySqlDocument(this, document));
     }
 
     async findOneAndUpdate(filter, update, options = {}) {

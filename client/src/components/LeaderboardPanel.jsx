@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { apiRequest } from '../api.js'
 
 export default function LeaderboardPanel() {
   const [players, setPlayers] = useState([])
@@ -7,12 +8,7 @@ export default function LeaderboardPanel() {
 
   useEffect(() => {
     let active = true
-    fetch('/api/leaderboard')
-      .then(async (response) => {
-        const data = await response.json().catch(() => ({}))
-        if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`)
-        return data
-      })
+    apiRequest('/api/leaderboard')
       .then((data) => {
         if (active) setPlayers(data.leaderboard || [])
       })

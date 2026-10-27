@@ -7,7 +7,7 @@
   },
   "scripts": {
     "install:all": "npm ci && npm ci --prefix client && npm ci --prefix server",
-    "dev": "concurrently -k -n server,client \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
+    "dev": "concurrently --kill-others-on-fail --names server,client \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
     "build": "npm run build --prefix client && npm run build --prefix server",
     "start": "npm start --prefix server"
   },

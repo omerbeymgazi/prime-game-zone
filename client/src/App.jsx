@@ -7,6 +7,7 @@ import LeaderboardPanel from './components/LeaderboardPanel.jsx'
 import PlayerDisputeForm from './components/PlayerDisputeForm.jsx'
 import StaffConsole from './components/StaffConsole.jsx'
 import PlayerSupportChat from './components/PlayerSupportChat.jsx'
+import { apiFetch, apiRequest } from './api.js'
 
 const API_BASE = '/api'
 const SUPPORT_TELEGRAM = (import.meta.env.VITE_SUPPORT_TELEGRAM || '').replace(/^@/, '')
@@ -39,17 +40,7 @@ function playInteractionFeedback() {
 }
 
 async function playerRequest(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    credentials: 'include',
-    ...options,
-    headers: {
-      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...options.headers,
-    },
-  })
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`)
-  return data
+  return apiRequest(`${API_BASE}${path}`, options)
 }
 
 function copyTextToClipboard(value) {
@@ -96,6 +87,8 @@ function mapTournamentSchedule(weeks) {
     filled: week.capacity - week.availableSlots,
     entryFee: week.entryFee ?? 1500,
     prizePool: week.prizePool ?? 20000,
+    prizeTiers: week.prizeTiers || [],
+    type: week.type || 'weekly',
     status: week.status,
   }))
 }
@@ -123,12 +116,7 @@ const tournament = {
   prizePool: '20,000 ETB',
 }
 
-const prizes = [
-  { place: '1st', medal: '🥇', className: 'gold' },
-  { place: '2nd', medal: '🥈', className: 'silver' },
-  { place: '3rd', medal: '🥉', className: 'bronze' },
-  { place: '4th', medal: '🏅', className: 'fourth' },
-]
+const prizeMedals = ['🥇', '🥈', '🥉', '🏅']
 
 const payments = [
   { id: 'telebirr', name: 'Telebirr', mark: 'T', image: '/Telebirr.png', detail: 'Mobile money' },
@@ -919,6 +907,9 @@ function TournamentTab({ onRegister, lang, schedule, scheduleError, selectedWeek
     0,
   ]
   prizeAmounts[3] = prizePool - prizeAmounts.slice(0, 3).reduce((total, amount) => total + amount, 0)
+  const prizeTiers = featuredTournament?.prizeTiers?.length
+    ? featuredTournament.prizeTiers
+    : prizeAmounts.map((amount, index) => ({ rank: index + 1, amount, reward: '' }))
 
   useEffect(() => {
     if (!detailsWeek) return undefined
@@ -966,14 +957,14 @@ function TournamentTab({ onRegister, lang, schedule, scheduleError, selectedWeek
       <section className="section-block">
         <SectionHeading kicker={text.competeForTop} title={text.prizeBreakdown} action={<span className="pool-chip">{Number(featuredTournament?.prizePool ?? 20000).toLocaleString()} ETB {text.totalPrizePool}</span>} />
         <div className="prize-grid">
-          {prizes.map((prize, index) => (
-            <article className={`prize-card prize-${prize.className}`} key={prize.place}>
+          {prizeTiers.map((prize, index) => (
+            <article className={`prize-card prize-${['gold', 'silver', 'bronze', 'fourth'][index] || 'fourth'}`} key={prize.rank}>
               <div className="prize-card-top">
-                <span className="prize-rank"><span className="prize-medal" aria-hidden="true">{prize.medal}</span><span>#{index + 1}</span></span>
-                <span className={`prize-status${index === 0 ? ' champion-badge' : ''}`}>{text[['champion', 'runnerUp', 'thirdAward', 'fourthAward'][index]]}</span>
+                <span className="prize-rank"><span className="prize-medal" aria-hidden="true">{prizeMedals[index] || '🏅'}</span><span>#{prize.rank}</span></span>
+                <span className={`prize-status${index === 0 ? ' champion-badge' : ''}`}>{text[['champion', 'runnerUp', 'thirdAward', 'fourthAward'][index]] || `${prize.rank}${prize.rank === 1 ? 'st' : prize.rank === 2 ? 'nd' : prize.rank === 3 ? 'rd' : 'th'} PLACE`}</span>
               </div>
-              <strong className="prize-amount"><span>{prizeAmounts[index].toLocaleString()}</span><small>ETB</small></strong>
-              <span className="prize-place">{text[`${['first', 'second', 'third', 'fourth'][index]}Place`]}</span>
+              {prize.amount > 0 && <strong className="prize-amount"><span>{Number(prize.amount).toLocaleString()}</span><small>ETB</small></strong>}
+              {prize.reward && <span className="prize-place">{prize.reward}</span>}
             </article>
           ))}
         </div>
@@ -1050,7 +1041,7 @@ function RulesModal({ text, onClose }) {
   )
 }
 
-function RegistrationTab({ form, onChange, onSubmit, submitted, submitting, submitError, copyAccountError, receiptName, onReceiptChange, lang, selectedWeek, onWeekChange, schedule, scheduleError, activeRegistration, addingToActive, onAddToActive, onCancelAddToActive, player, participants, onAddParticipant, onParticipantChange, onRemoveParticipant, paymentAccounts, onCopyAccount, copiedAccount, totalEntryFee }) {
+function RegistrationTab({ form, onChange, onSubmit, onRequireSignIn, submitted, submitting, submitError, copyAccountError, receiptName, onReceiptChange, lang, selectedWeek, onWeekChange, schedule, scheduleError, activeRegistration, addingToActive, onAddToActive, onCancelAddToActive, player, participants, onAddParticipant, onParticipantChange, onRemoveParticipant, paymentAccounts, onCopyAccount, copiedAccount, totalEntryFee }) {
   const text = translations[lang]
   const selectedSchedule = schedule.find((week) => week.id === selectedWeek)
     || { name: text.tournament, dateRange: '', entryFee: 1500, capacity: 32, remaining: 32, status: 'open' }
@@ -1070,6 +1061,10 @@ function RegistrationTab({ form, onChange, onSubmit, submitted, submitting, subm
       </div>
       <p className="registration-week-selection"><Icon name="calendar" size={15} /><span>{text.registrationWeek}: <strong>{selectedSchedule.name || text[selectedSchedule.nameKey]}</strong> · {selectedSchedule.dateRange}</span></p>
       {scheduleError && <p className="registration-error" role="alert">{scheduleError}</p>}
+      {!player && <div className="registration-sign-in-notice" role="status">
+        <span>{lang === 'ET' ? 'ምዝገባን ለመጨረስ በተጫዋች መለያዎ ይግቡ።' : 'Sign in to your player account to register with a verified identity.'}</span>
+        <button type="button" onClick={onRequireSignIn}>{lang === 'ET' ? 'ይግቡ' : 'Sign in'}</button>
+      </div>}
 
       {activeRegistration && !addingToActive ? <div className="registration-active-notice" role="status">
         <strong>{lang === 'ET' ? 'በአንድ ጊዜ በአንድ ውድድር ብቻ ሊሳተፉ ይችላሉ።' : 'Your account can be active in one tournament at a time.'}</strong>
@@ -1167,7 +1162,7 @@ function RegistrationTab({ form, onChange, onSubmit, submitted, submitting, subm
         <label className="receipt-upload" htmlFor="payment-receipt">
           <Icon name="ticket" size={17} />
           <span>{receiptName || text.receiptUpload}</span>
-          <input key={receiptName || 'empty'} id="payment-receipt" type="file" accept="image/png,image/jpeg,image/webp" onChange={onReceiptChange} required />
+          <input id="payment-receipt" type="file" accept="image/png,image/jpeg,image/webp" onChange={onReceiptChange} required />
         </label>
 
         <div className="form-section-title payment-title"><span>{addingToActive ? '01' : '02'}</span><strong>{text.paymentMethod}</strong></div>
@@ -1187,7 +1182,7 @@ function RegistrationTab({ form, onChange, onSubmit, submitted, submitting, subm
 
         <div className="payment-disclaimer"><Icon name="shield" size={16} /><span>{text.paymentDisclaimer}</span></div>
         <p className="group-total">{lang === 'ET' ? 'አጠቃላይ ክፍያ' : 'Group total'} <strong>{totalEntryFee.toLocaleString()} ETB</strong> <span>· {addingToActive ? participants.length : participants.length + 1} {(addingToActive ? participants.length : participants.length + 1) === 1 ? 'player' : 'players'}</span></p>
-        <button className="primary-button full-button payment-submit" type="submit" disabled={submitting || !['open', 'full'].includes(selectedSchedule.status) || (addingToActive && participants.length === 0) || selectedSchedule.remaining < (addingToActive ? participants.length : participants.length + 1)}>
+        <button className="primary-button full-button payment-submit" type="submit" disabled={!player || submitting || !['open', 'full'].includes(selectedSchedule.status) || (addingToActive && participants.length === 0) || selectedSchedule.remaining < (addingToActive ? participants.length : participants.length + 1)}>
           {submitting ? (lang === 'ET' ? 'በማስቀመጥ ላይ...' : 'Saving registration…') : !['open', 'full'].includes(selectedSchedule.status) || selectedSchedule.remaining < 1 ? text.registrationClosed : text.proceedPayment} {!submitting && <Icon name="arrow" size={17} />}
         </button>
         {copyAccountError && <p className="registration-error" role="alert">{copyAccountError}</p>}
@@ -1250,7 +1245,7 @@ function TournamentScheduleCards({
               : text.weekOpen
         const displayName = lang === 'ET' ? `${text.cup} ${week.id + 1}` : week.name
         return (
-          <article className={`weekly-option${selectedWeek === week.id ? ' weekly-option--selected' : ''}`} key={week.id}>
+          <article className={`weekly-option${selectedWeek === week.id ? ' weekly-option--selected' : ''}`} key={week.id} style={{ '--tournament-accent': week.type === 'daily' ? '#F59E0B' : week.type === 'monthly' ? '#8B5CF6' : '#3B82F6' }}>
             <div className="tournament-card-heading">
               <div className="tournament-card-title">
                 <small>{text.cupSeries}</small>
@@ -1404,12 +1399,8 @@ function RegistrationPassCard({ entry, lang }) {
       credentials: 'include',
       cache: 'no-store',
     }
-    fetch(`${API_BASE}/player/registrations/${encodeURIComponent(entry.id)}/pass`, requestOptions)
+    apiFetch(`${API_BASE}/player/registrations/${encodeURIComponent(entry.id)}/pass`, requestOptions)
       .then(async (response) => {
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}))
-          throw new Error(data.error || `Pass request failed (${response.status}).`)
-        }
         const image = await response.blob()
         if (!image.type.startsWith('image/')) throw new Error('The server did not return a QR image.')
         return image
@@ -1422,10 +1413,8 @@ function RegistrationPassCard({ entry, lang }) {
       .catch((error) => {
         if (active) setLoadError(error.message)
       })
-    fetch(`${API_BASE}/player/registrations/${encodeURIComponent(entry.id)}/pass-code`, requestOptions)
-      .then(async (response) => {
-        const data = await response.json().catch(() => ({}))
-        if (!response.ok) throw new Error(data.error || `Pass code request failed (${response.status}).`)
+    apiRequest(`${API_BASE}/player/registrations/${encodeURIComponent(entry.id)}/pass-code`, requestOptions)
+      .then((data) => {
         if (active) setPassCode(data.passCode || '')
       })
       .catch((error) => {
@@ -1479,10 +1468,111 @@ function RegistrationPassCard({ entry, lang }) {
   )
 }
 
+function RegistrationDetails({ entry, lang }) {
+  const [open, setOpen] = useState(false)
+
+  return (
+    <details className="registration-details" onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary><Icon name="chevron" size={15} />{lang === 'ET' ? 'ዝርዝር ይመልከቱ' : 'View Details'}</summary>
+      <dl>
+        <div><dt>{lang === 'ET' ? 'የማረጋገጫ ኮድ' : 'Confirmation code'}</dt><dd>{entry.confirmationCode || '—'}</dd></div>
+        <div><dt>{lang === 'ET' ? 'የክፍያ ዘዴ' : 'Payment method'}</dt><dd>{entry.payment || '—'}</dd></div>
+        {entry.contact && <div><dt>{lang === 'ET' ? 'ስልክ' : 'Contact'}</dt><dd>{entry.contact}</dd></div>}
+        {entry.tournament?.dateRange && <div><dt>{lang === 'ET' ? 'ቀን' : 'Dates'}</dt><dd>{entry.tournament.dateRange}</dd></div>}
+      </dl>
+      {open && entry.hasPass && <RegistrationPassCard entry={entry} lang={lang} />}
+    </details>
+  )
+}
+
+function PaymentResubmission({ entry, lang, onResubmitted }) {
+  const [open, setOpen] = useState(false)
+  const [receiptData, setReceiptData] = useState('')
+  const [receiptName, setReceiptName] = useState('')
+  const [payment, setPayment] = useState(entry.payment || 'telebirr')
+  const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  function chooseReceipt(event) {
+    const file = event.target.files?.[0]
+    if (!file) return
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size > 5 * 1024 * 1024) {
+      setReceiptData('')
+      setReceiptName('')
+      setError(lang === 'ET' ? 'PNG፣ JPG ወይም WebP እስከ 5 MB የሆነ ምስል ይምረጡ።' : 'Choose a PNG, JPG, or WebP image up to 5 MB.')
+      event.target.value = ''
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        setReceiptData(reader.result)
+        setReceiptName(file.name)
+        setError('')
+      } else {
+        setError(lang === 'ET' ? 'የደረሰኙን ምስል ማንበብ አልተቻለም።' : 'The receipt image could not be read.')
+      }
+    }
+    reader.onerror = () => setError(lang === 'ET' ? 'የደረሰኙን ምስል ማንበብ አልተቻለም።' : 'The receipt image could not be read.')
+    reader.readAsDataURL(file)
+  }
+
+  async function submit(event) {
+    event.preventDefault()
+    if (!receiptData) {
+      setError(lang === 'ET' ? 'ከመላክዎ በፊት የተስተካከለ ደረሰኝ ይጫኑ።' : 'Upload the corrected receipt before resubmitting.')
+      return
+    }
+    setSubmitting(true)
+    setError('')
+    try {
+      const data = await apiRequest(`${API_BASE}/player/registrations/${encodeURIComponent(entry.id)}/resubmit`, {
+        method: 'POST',
+        body: JSON.stringify({ receiptData, payment }),
+      })
+      onResubmitted(data.registrations || [])
+      setOpen(false)
+      setReceiptData('')
+      setReceiptName('')
+    } catch (requestError) {
+      setError(requestError.message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="payment-resubmission">
+      <button className="payment-resubmission-trigger" type="button" aria-expanded={open} onClick={() => {
+        setOpen((current) => !current)
+        setError('')
+      }}>{lang === 'ET' ? 'ይግባኝ / ክፍያን እንደገና ይላኩ' : 'Appeal / Re-submit Payment'}</button>
+      {open && <form className="payment-resubmission-form" onSubmit={submit}>
+        <label className="field-label">{lang === 'ET' ? 'የተስተካከለ የክፍያ ደረሰኝ' : 'Corrected payment screenshot'}
+          <input type="file" accept="image/png,image/jpeg,image/webp" onChange={chooseReceipt} required />
+        </label>
+        {receiptName && <small className="payment-resubmission-file">{receiptName}</small>}
+        <label className="field-label">{lang === 'ET' ? 'የክፍያ ዘዴ' : 'Payment method'}
+          <select value={payment} onChange={(event) => setPayment(event.target.value)} required>
+            <option value="telebirr">Telebirr</option>
+            <option value="cbe">CBE Bank</option>
+            <option value="cash">Cash</option>
+          </select>
+        </label>
+        {error && <p className="registration-error" role="alert">{error}</p>}
+        <div className="payment-resubmission-actions">
+          <button className="primary-button" type="submit" disabled={submitting || !receiptData}>{submitting ? (lang === 'ET' ? 'በመላክ ላይ...' : 'Resubmitting…') : (lang === 'ET' ? 'እንደገና ይላኩ' : 'Resubmit payment')}</button>
+          <button type="button" onClick={() => setOpen(false)}>{lang === 'ET' ? 'ሰርዝ' : 'Cancel'}</button>
+        </div>
+      </form>}
+    </div>
+  )
+}
+
 function ProfileTab({
   registration, registrations, player, schedule, onRegister, onLogout, onProfileSave,
   onAccountDelete, lang, avatar, onAvatarChange, avatarError, scheduleError, selectedWeek, authenticated,
-  profileCommand, onProfileCommandHandled, supportUrl, activeRegistration,
+  profileCommand, onProfileCommandHandled, supportUrl, activeRegistration, onResubmitted,
 }) {
   const text = translations[lang]
   const [profileOpen, setProfileOpen] = useState(false)
@@ -1538,9 +1628,7 @@ function ProfileTab({
     setBracketLoading(true)
     setBracketError('')
     try {
-      const response = await fetch(`${API_BASE}/tournaments/${scheduleWeek.id}/fixtures`)
-      const data = await response.json().catch(() => ({}))
-      if (!response.ok) throw new Error(data.error || `Bracket request failed (${response.status}).`)
+      const data = await playerRequest(`/tournaments/${scheduleWeek.id}/fixtures`)
       setBracketMatches(data.matches || [])
       setBracketOpen(true)
     } catch (error) {
@@ -1619,7 +1707,6 @@ function ProfileTab({
               <small>{entry.tournament?.name || schedule.find((week) => week.id === entry.weekId)?.name || `${text.week} ${entry.weekId + 1}`}{entry.registeredForOthers && <b className="registration-for-other-badge">{lang === 'ET' ? 'በእርስዎ የተመዘገበ' : 'Registered by you'}</b>}</small>
               <strong>{entry.playerName}</strong>
               <span>{entry.tournament?.dateRange || entry.confirmationCode}</span>
-              {entry.contact && <span>{entry.contact}</span>}
               {entry.paymentStatus === 'approved' && <span>{lang === 'ET' ? 'ፓስ' : 'Pass'} · {entry.passStage?.replaceAll('_', ' ') || 'not started'}</span>}
               {entry.paymentStatus === 'rejected' && entry.rejectionReason && <span>{lang === 'ET' ? 'ምክንያት' : 'Reason'}: {entry.rejectionReason}</span>}
             </span>
@@ -1628,7 +1715,8 @@ function ProfileTab({
               : entry.paymentStatus === 'rejected'
                 ? (lang === 'ET' ? 'ክፍያ ተከልክሏል' : 'Payment rejected')
                 : (lang === 'ET' ? 'ክፍያ በመጠባበቅ ላይ' : 'Pending approval')}</span>
-            {entry.hasPass && <RegistrationPassCard entry={entry} lang={lang} />}
+              <RegistrationDetails entry={entry} lang={lang} />
+              {entry.paymentStatus === 'rejected' && <PaymentResubmission entry={entry} lang={lang} onResubmitted={onResubmitted} />}
           </article>
         )) : (
           <div className="empty-state"><span className="empty-icon"><Icon name="ticket" size={21} /></span><strong>{text.noRegistrations}</strong><span>{text.nextCompetition}</span><button type="button" onClick={() => onRegister(selectedWeek)}>{text.exploreRegistration} <Icon name="arrow" size={15} /></button></div>
@@ -1676,7 +1764,8 @@ function ProfileTab({
                     {entry.checkInStatus === 'checked_in' && <small>{lang === 'ET' ? 'ገብቷል · ዝግጁ' : 'Checked in · Ready'}</small>}
                     {entry.passStage && entry.passStage !== 'not_started' && <small>{lang === 'ET' ? 'የፓስ ደረጃ' : 'Pass stage'}: {entry.passStage.replaceAll('_', ' ')}</small>}
                   </div>
-                  {entry.hasPass && <RegistrationPassCard entry={entry} lang={lang} />}
+                  <RegistrationDetails entry={entry} lang={lang} />
+                  {entry.paymentStatus === 'rejected' && <PaymentResubmission entry={entry} lang={lang} onResubmitted={onResubmitted} />}
                 </article>
               ))
               : <p>{text.noRegistrations}</p>}
@@ -1853,15 +1942,20 @@ function App({ loading = false, authChecking = false, loadingMessage }) {
       .catch((error) => {
         if (active && !/sign-in is required/i.test(error.message)) setAuthError(error.message)
       })
-    playerRequest('/payment-accounts')
+    return () => { active = false }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    playerRequest('/payment-accounts', { cache: 'no-store' })
       .then((data) => {
-        if (active) setPaymentAccounts(data.accounts || [])
+        if (active) setPaymentAccounts(Array.isArray(data.accounts) ? data.accounts : [])
       })
       .catch((error) => {
         if (active) setRegistrationError(error.message)
       })
     return () => { active = false }
-  }, [])
+  }, [form.payment])
 
   useEffect(() => {
     if (!player?.id) return undefined
@@ -1902,11 +1996,7 @@ function App({ loading = false, authChecking = false, loadingMessage }) {
   useEffect(() => {
     if (SUPPORT_TELEGRAM) return
     let active = true
-    fetch(`${API_BASE}/health`)
-      .then((response) => {
-        if (!response.ok) throw new Error(`Support endpoint request failed (${response.status}).`)
-        return response.json()
-      })
+    playerRequest('/health')
       .then((data) => {
         if (active && /^[A-Za-z0-9_]{5,32}$/.test(data.bot?.username || '')) {
           setSupportUrl(`https://t.me/${data.bot.username}`)
@@ -2301,6 +2391,12 @@ function App({ loading = false, authChecking = false, loadingMessage }) {
 
   async function register(event) {
     event.preventDefault()
+    if (!player) {
+      setAuthMode('login')
+      setRegistrationError('Sign in to your player account before registering.')
+      setShowLogin(true)
+      return
+    }
     setSubmittingRegistration(true)
     setRegistrationError('')
     try {
@@ -2317,10 +2413,9 @@ function App({ loading = false, authChecking = false, loadingMessage }) {
       if (addingToActive && additionalPlayers.length === 0) {
         throw new Error(lang === 'ET' ? 'ከመቀጠልዎ በፊት ተጨማሪ ተጫዋች ያክሉ።' : 'Add at least one player before continuing.')
       }
-      const response = await fetch(`${API_BASE}${isGroupCheckout ? '/registrations/group' : '/registrations'}`, {
+      const data = await apiRequest(`${API_BASE}${isGroupCheckout ? '/registrations/group' : '/registrations'}`, {
         method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
+        retryUnsafe: true,
         body: JSON.stringify(isGroupCheckout ? {
           payment: form.payment,
           weekId: addingToActive ? selectedWeek : currentWeekId,
@@ -2340,8 +2435,6 @@ function App({ loading = false, authChecking = false, loadingMessage }) {
           receiptData,
         }),
       })
-      const data = await response.json().catch(() => ({}))
-      if (!response.ok) throw new Error(data.error || `Registration request failed (${response.status}).`)
       setRegistration({
         ...(data.registration || data.registrations?.[0]),
         registrations: data.registrations || [data.registration],
@@ -2430,11 +2523,24 @@ function App({ loading = false, authChecking = false, loadingMessage }) {
           setSelectedWeek(weekId ?? currentWeekId)
           navigate('register')
         }} lang={lang} schedule={scopedSchedule} scheduleError={scheduleError} selectedWeek={currentWeekId} activeRegistration={activeRegistration} />}
-        {activeTab === 'register' && <RegistrationTab form={form} onChange={updateForm} onSubmit={register} submitted={submitted} submitting={submittingRegistration} submitError={receiptError || registrationError} copyAccountError={copyAccountError} receiptName={receiptName} onReceiptChange={changeReceipt} lang={lang} selectedWeek={currentWeekId} onWeekChange={setSelectedWeek} schedule={scopedSchedule} scheduleError={scheduleError} activeRegistration={activeRegistration} addingToActive={addingToActive} onAddToActive={addPlayerToActiveTournament} onCancelAddToActive={cancelAddToActiveTournament} player={player} participants={extraParticipants} onAddParticipant={addGroupParticipant} onParticipantChange={updateGroupParticipant} onRemoveParticipant={(id) => setExtraParticipants((current) => current.filter((item) => item.id !== id))} paymentAccounts={paymentAccounts} onCopyAccount={copyPaymentAccount} copiedAccount={copiedAccount} totalEntryFee={Number(scopedSchedule.find((week) => week.id === currentWeekId)?.entryFee ?? 1500) * (addingToActive ? extraParticipants.length : extraParticipants.length + 1)} />}
+        {activeTab === 'register' && <RegistrationTab form={form} onChange={updateForm} onSubmit={register} onRequireSignIn={() => {
+          setAuthMode('login')
+          setAuthError('')
+          setShowLogin(true)
+        }} submitted={submitted} submitting={submittingRegistration} submitError={receiptError || registrationError} copyAccountError={copyAccountError} receiptName={receiptName} onReceiptChange={changeReceipt} lang={lang} selectedWeek={currentWeekId} onWeekChange={setSelectedWeek} schedule={scopedSchedule} scheduleError={scheduleError} activeRegistration={activeRegistration} addingToActive={addingToActive} onAddToActive={addPlayerToActiveTournament} onCancelAddToActive={cancelAddToActiveTournament} player={player} participants={extraParticipants} onAddParticipant={addGroupParticipant} onParticipantChange={updateGroupParticipant} onRemoveParticipant={(id) => setExtraParticipants((current) => current.filter((item) => item.id !== id))} paymentAccounts={paymentAccounts} onCopyAccount={copyPaymentAccount} copiedAccount={copiedAccount} totalEntryFee={Number(scopedSchedule.find((week) => week.id === currentWeekId)?.entryFee ?? 1500) * (addingToActive ? extraParticipants.length : extraParticipants.length + 1)} />}
         {activeTab === 'profile' && <ProfileTab registration={registration} registrations={playerRegistrations} player={player} schedule={scopedSchedule} onRegister={(weekId) => {
           setSelectedWeek(weekId ?? currentWeekId)
           navigate('register')
-        }} onLogout={logoutPlayer} onProfileSave={savePlayerProfile} onAccountDelete={deletePlayerAccount} lang={lang} avatar={avatar} onAvatarChange={changeAvatar} avatarError={avatarError} scheduleError={scheduleError} selectedWeek={currentWeekId} authenticated={Boolean(player)} profileCommand={profileCommand} onProfileCommandHandled={handleProfileCommandHandled} supportUrl={supportUrl} activeRegistration={activeRegistration} />}
+        }} onLogout={logoutPlayer} onProfileSave={savePlayerProfile} onAccountDelete={deletePlayerAccount} lang={lang} avatar={avatar} onAvatarChange={changeAvatar} avatarError={avatarError} scheduleError={scheduleError} selectedWeek={currentWeekId} authenticated={Boolean(player)} profileCommand={profileCommand} onProfileCommandHandled={handleProfileCommandHandled} supportUrl={supportUrl} activeRegistration={activeRegistration} onResubmitted={(updatedRegistrations) => {
+          const updatedById = new Map(updatedRegistrations.map((entry) => [String(entry.id), entry]))
+          setPlayerRegistrations((current) => current.map((entry) => ({
+            ...entry,
+            ...(updatedById.get(String(entry.id)) || {}),
+          })))
+          setActiveRegistration((current) => current && updatedById.has(String(current.id))
+            ? { ...current, ...updatedById.get(String(current.id)) }
+            : current)
+        }} />}
       </div>
       <PlayerSupportChat player={player} lang={lang} theme={theme} />
       <footer className="legal-footer">{text.footer}</footer>

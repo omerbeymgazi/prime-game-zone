@@ -1,25 +1,16 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import './AdminDashboard.css'
 import './AdminPayments.css'
 import AdminChatManager from './AdminChatManager.jsx'
 import { AdminDisputesPanel, AdminFinancePanel } from './AdminModules.jsx'
 import ChatBackgroundPicker from './ChatBackgroundPicker.jsx'
+import { apiRequest } from '../api.js'
 
 const API_BASE = '/api'
 
 async function request(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    credentials: 'include',
-    ...options,
-    headers: {
-      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...options.headers,
-    },
-  })
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`)
-  return data
+  return apiRequest(`${API_BASE}${path}`, options)
 }
 
 function downloadRosterCsv(roster, tournament) {
@@ -45,15 +36,31 @@ function downloadRosterCsv(roster, tournament) {
 }
 
 function tournamentForm(tournament) {
+  const pool = tournament?.prizePool ?? 20000
+  const first = Math.round(pool * 0.5)
+  const second = Math.round(pool * 0.25)
+  const third = Math.round(pool * 0.15)
   return tournament
     ? {
         dateRange: tournament.dateRange,
         capacity: String(tournament.capacity),
         entryFee: String(tournament.entryFee ?? 1500),
-        prizePool: String(tournament.prizePool ?? 20000),
+        prizeTiers: (tournament.prizeTiers || [first, second, third, pool - first - second - third]
+          .map((amount, index) => ({ rank: index + 1, amount, reward: '' })))
+          .map((tier) => ({ ...tier, amount: String(tier.amount) })),
+        type: tournament.type || 'weekly',
+        format: tournament.format || 'knockout',
         status: tournament.status,
       }
-    : { dateRange: '', capacity: '32', entryFee: '1500', prizePool: '20000', status: 'upcoming' }
+    : {
+        dateRange: '',
+        capacity: '32',
+        entryFee: '1500',
+        prizeTiers: [10000, 5000, 3000, 2000].map((amount, index) => ({ rank: index + 1, amount: String(amount), reward: '' })),
+        type: 'weekly',
+        format: 'knockout',
+        status: 'upcoming',
+      }
 }
 
 function localDateTime(value) {
@@ -129,6 +136,7 @@ export default function AdminDashboard() {
   const [playerDetails, setPlayerDetails] = useState({ playerName: '', contact: '', telegramUsername: '' })
   const [matchDialog, setMatchDialog] = useState(null)
   const [matchDetails, setMatchDetails] = useState({ status: 'pending', score1: '', score2: '', scheduledAt: '', location: '' })
+  const approvalIdsRef = useRef('')
 
   const selectedTournament = tournaments.find((item) => item.weekId === selectedTournamentId) || null
   const pendingPayments = useMemo(
@@ -151,6 +159,11 @@ export default function AdminDashboard() {
       ])
       setTournaments(tournamentData.tournaments)
       setRegistrations(registrationData.registrations)
+      approvalIdsRef.current = registrationData.registrations
+        .filter((registration) => registration.paymentStatus === 'pending')
+        .map((registration) => registration.id)
+        .sort()
+        .join(',')
       setPaymentGroups(paymentData.groups || [])
       setPaymentAccounts(accountsData.accounts || [])
       setSelectedTournamentId((current) => (
@@ -162,6 +175,31 @@ export default function AdminDashboard() {
       setError(requestError.message)
     } finally {
       setLoading(false)
+    }
+  }, [])
+
+  const refreshApprovals = useCallback(async () => {
+    try {
+      const registrationData = await request('/admin/registrations?summary=1')
+      const registrationIds = registrationData.registrations
+        .filter((registration) => registration.paymentStatus === 'pending')
+        .map((registration) => registration.id)
+        .sort()
+        .join(',')
+      setRegistrations((current) => {
+        const existing = new Map(current.map((registration) => [String(registration.id), registration]))
+        return registrationData.registrations.map((registration) => ({
+          ...registration,
+          receiptData: existing.get(String(registration.id))?.receiptData || '',
+        }))
+      })
+      if (registrationIds !== approvalIdsRef.current) {
+        approvalIdsRef.current = registrationIds
+        const paymentData = await request('/admin/payment-groups')
+        setPaymentGroups(paymentData.groups || [])
+      }
+    } catch (requestError) {
+      setError(requestError.message)
     }
   }, [])
 
@@ -182,6 +220,12 @@ export default function AdminDashboard() {
       })
     return () => { active = false }
   }, [loadDashboard])
+
+  useEffect(() => {
+    if (!authenticated) return undefined
+    const timer = window.setInterval(refreshApprovals, 10_000)
+    return () => window.clearInterval(timer)
+  }, [authenticated, refreshApprovals])
 
   useEffect(() => {
     if (!authenticated || activeView !== 'players' || selectedTournamentId === null) return
@@ -284,7 +328,12 @@ export default function AdminDashboard() {
       ...tournamentDetails,
       capacity: Number(tournamentDetails.capacity),
       entryFee: Number(tournamentDetails.entryFee),
-      prizePool: Number(tournamentDetails.prizePool),
+      prizeTiers: tournamentDetails.prizeTiers.map((tier, index) => ({
+        rank: index + 1,
+        amount: Number(tier.amount),
+        reward: tier.reward.trim(),
+      })),
+      prizePool: tournamentDetails.prizeTiers.reduce((sum, tier) => sum + Number(tier.amount || 0), 0),
     }
     setBusyId('tournament-save')
     setError('')
@@ -794,10 +843,10 @@ export default function AdminDashboard() {
                 <div className="admin-bracket-summary">
                   <div><span>APPROVED PLAYERS</span><strong>{approvedPlayers}</strong></div>
                   <div><span>PLAYED MATCHES</span><strong>{finishedMatches}</strong></div>
-                  <div><span>BRACKET ROUNDS</span><strong>{rounds.length}</strong></div>
+                  <div><span>{selectedTournament?.format === 'league' ? 'LEAGUE ROUNDS' : 'BRACKET ROUNDS'}</span><strong>{rounds.length}</strong></div>
                 </div>
                 {bracketMatches.length === 0
-                  ? <div className="admin-empty-state"><span>✦</span><h3>Your bracket starts here</h3><p>Approve at least two players, then generate a randomized single-elimination draw.</p><button className="admin-primary" type="button" disabled={!canGenerate} onClick={generateFixtures}>Generate fixtures</button></div>
+                  ? <div className="admin-empty-state"><span>✦</span><h3>Your {selectedTournament?.format === 'league' ? 'league schedule' : 'bracket'} starts here</h3><p>Approve at least two players, then generate {selectedTournament?.format === 'league' ? 'a round-robin league schedule' : 'a randomized single-elimination draw'}.</p><button className="admin-primary" type="button" disabled={!canGenerate} onClick={generateFixtures}>Generate fixtures</button></div>
                   : <div className="admin-rounds">
                     {rounds.map((round) => {
                       const roundMatches = bracketMatches.filter((match) => match.round === round)
@@ -812,7 +861,7 @@ export default function AdminDashboard() {
                   : bracketStandings.map((standing) => (
                     <article className="admin-standing-row" key={standing.player.id}>
                       <strong>{String(standing.rank).padStart(2, '0')}</strong>
-                      <span><b>{standing.player.playerName}</b><small>{standing.wins}W · {standing.losses}L · {standing.goalsFor}:{standing.goalsAgainst}</small></span>
+                      <span><b>{standing.player.playerName}</b><small>{selectedTournament?.format === 'league' ? `${standing.points} pts · ` : ''}{standing.wins}W · {standing.losses}L · {standing.goalsFor}:{standing.goalsAgainst}</small></span>
                       {standing.champion && <i>CHAMPION</i>}
                     </article>
                   ))}
@@ -830,8 +879,16 @@ export default function AdminDashboard() {
             <h2 id="tournament-dialog-title">{tournamentDialog === 'new' ? 'Create tournament' : 'Edit tournament'}</h2>
             <label htmlFor="tournament-date">Date or date range</label><input id="tournament-date" value={tournamentDetails.dateRange} maxLength={40} placeholder="Nov 1 - Nov 7" onChange={(event) => setTournamentDetails({ ...tournamentDetails, dateRange: event.target.value })} required />
             <div className="admin-modal-row"><div><label htmlFor="tournament-capacity">Player capacity</label><input id="tournament-capacity" type="number" min="2" max="128" value={tournamentDetails.capacity} onChange={(event) => setTournamentDetails({ ...tournamentDetails, capacity: event.target.value })} required /></div><div><label htmlFor="tournament-status">Status</label><select id="tournament-status" value={tournamentDetails.status} onChange={(event) => setTournamentDetails({ ...tournamentDetails, status: event.target.value })}><option value="upcoming">Upcoming</option><option value="live">Live</option><option value="completed">Completed</option></select></div></div>
+            <div className="admin-modal-row"><div><label htmlFor="tournament-type">Tournament type</label><select id="tournament-type" value={tournamentDetails.type} onChange={(event) => setTournamentDetails({ ...tournamentDetails, type: event.target.value })}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></div><div><label htmlFor="tournament-format">Match format</label><select id="tournament-format" value={tournamentDetails.format} onChange={(event) => setTournamentDetails({ ...tournamentDetails, format: event.target.value })}><option value="knockout">Knockout</option><option value="league">League</option></select></div></div>
             <label htmlFor="tournament-fee">Entry fee (ETB)</label><input id="tournament-fee" type="number" min="0" max="1000000" value={tournamentDetails.entryFee} onChange={(event) => setTournamentDetails({ ...tournamentDetails, entryFee: event.target.value })} required />
-            <label htmlFor="tournament-prize-pool">Prize pool (ETB)</label><input id="tournament-prize-pool" type="number" min="0" max="10000000" value={tournamentDetails.prizePool} onChange={(event) => setTournamentDetails({ ...tournamentDetails, prizePool: event.target.value })} required />
+            <fieldset className="admin-prize-tiers"><legend>Prize distribution</legend><p>Total cash awards: {tournamentDetails.prizeTiers.reduce((sum, tier) => sum + Number(tier.amount || 0), 0).toLocaleString()} ETB</p>
+              {tournamentDetails.prizeTiers.map((tier, index) => <div className="admin-prize-tier" key={tier.rank}>
+                <strong>Place {tier.rank}</strong>
+                <div className="admin-modal-row"><div><label htmlFor={`prize-amount-${tier.rank}`}>Cash amount (ETB)</label><input id={`prize-amount-${tier.rank}`} type="number" min="0" max="10000000" value={tier.amount} onChange={(event) => setTournamentDetails((current) => ({ ...current, prizeTiers: current.prizeTiers.map((item, itemIndex) => itemIndex === index ? { ...item, amount: event.target.value } : item) }))} required /></div><div><label htmlFor={`prize-reward-${tier.rank}`}>Additional reward</label><input id={`prize-reward-${tier.rank}`} maxLength={120} value={tier.reward} onChange={(event) => setTournamentDetails((current) => ({ ...current, prizeTiers: current.prizeTiers.map((item, itemIndex) => itemIndex === index ? { ...item, reward: event.target.value } : item) }))} placeholder="Optional reward" /></div></div>
+                {index > 0 && <button className="admin-secondary" type="button" onClick={() => setTournamentDetails((current) => ({ ...current, prizeTiers: current.prizeTiers.filter((_, itemIndex) => itemIndex !== index).map((item, itemIndex) => ({ ...item, rank: itemIndex + 1 })) }))}>Remove place</button>}
+              </div>)}
+              {tournamentDetails.prizeTiers.length < 128 && <button className="admin-secondary" type="button" onClick={() => setTournamentDetails((current) => ({ ...current, prizeTiers: [...current.prizeTiers, { rank: current.prizeTiers.length + 1, amount: '0', reward: '' }] }))}>Add prize place</button>}
+            </fieldset>
             {error && <p className="admin-error" role="alert">{error}</p>}
             <div className="admin-modal-actions"><button className="admin-secondary" type="button" onClick={() => setTournamentDialog(null)}>Cancel</button><button className="admin-primary" type="submit" disabled={busyId === 'tournament-save'}>{busyId === 'tournament-save' ? 'Saving…' : 'Save tournament'}</button></div>
           </form>

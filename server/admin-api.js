@@ -10,13 +10,32 @@ const SESSION_LIFETIME_MS = 8 * 60 * 60 * 1000;
 const PLAYER_SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const PAYMENT_METHODS = ['telebirr', 'cbe', 'cash'];
 const STATUSES = ['open', 'full', 'live', 'completed'];
+const ACTIVE_TOURNAMENT_STATUSES = ['open', 'full', 'live'];
 const ADMIN_STATUSES = ['upcoming', 'live', 'completed'];
+const TOURNAMENT_TYPES = ['daily', 'weekly', 'monthly'];
+const TOURNAMENT_FORMATS = ['knockout', 'league'];
 const MATCH_STATUSES = ['pending', 'ongoing', 'finished', 'bye'];
 const PASS_STAGE_ORDER = ['not_started', 'check_in', 'play_off', 'end_of_play'];
+const REGISTRATION_IDENTITY_LOCK = 'pgz_registration_identity';
+const MAX_PRIZE_POOL = 10_000_000;
+const MAX_PRIZE_TIERS = 128;
+const MATCH_REMINDER_WINDOW_MS = 15 * 60 * 1000;
+
+function normalizeTelegramUsername(value) {
+    return String(value || '').trim().replace(/^@/, '').toLowerCase();
+}
+
+function telegramUsernameConflict(players, username, playerId = null) {
+    const normalized = normalizeTelegramUsername(username);
+    return Boolean(normalized && players.some((player) => (
+        normalizeTelegramUsername(player.telegramUsername) === normalized
+        && String(player._id) !== String(playerId || '')
+    )));
+}
 
 function parseTelegramUsername(value) {
     if (typeof value !== 'string') return { error: 'Enter a valid Telegram username.' };
-    const username = value.trim().replace(/^@/, '');
+    const username = normalizeTelegramUsername(value);
     if (!/^[A-Za-z0-9_]{5,32}$/.test(username)) {
         return { error: 'Telegram username must be 5–32 letters, numbers, or underscores.' };
     }
@@ -38,6 +57,45 @@ function parseRegistrationReceipt(receiptData) {
     }
     return { data: receiptData, mime: match[1], buffer };
 }
+
+async function acquireRegistrationIdentityLock(connection) {
+    const [rows] = await connection.execute('SELECT GET_LOCK(?, 5) AS acquired', [REGISTRATION_IDENTITY_LOCK]);
+    return Number(rows[0]?.acquired) === 1;
+}
+
+function registrationReceiptKey(registration) {
+    return String(registration.paymentGroupId || registration._id || '');
+}
+
+async function claimPaymentReceipt(connection, receipt, claimKey, playerId) {
+    const receiptHash = crypto.createHash('sha256').update(receipt.buffer).digest('hex');
+    const [existingClaims] = await connection.execute(
+        'SELECT claim_key AS claimKey FROM payment_receipt_claims WHERE receipt_hash = ? FOR UPDATE',
+        [receiptHash],
+    );
+    if (existingClaims.length) {
+        if (existingClaims[0].claimKey === claimKey) return receiptHash;
+        throw Object.assign(new Error('This payment receipt has already been used for another registration.'), { code: 'RECEIPT_ALREADY_USED' });
+    }
+
+    try {
+        await connection.execute(
+            'INSERT INTO payment_receipt_claims (receipt_hash, claim_key, player_id) VALUES (?, ?, ?)',
+            [receiptHash, claimKey, playerId ? String(playerId) : null],
+        );
+    } catch (error) {
+        if (!isDuplicateKeyError(error)) throw error;
+        const [claims] = await connection.execute(
+            'SELECT claim_key AS claimKey FROM payment_receipt_claims WHERE receipt_hash = ? FOR UPDATE',
+            [receiptHash],
+        );
+        if (claims[0]?.claimKey !== claimKey) {
+            throw Object.assign(new Error('This payment receipt has already been used for another registration.'), { code: 'RECEIPT_ALREADY_USED' });
+        }
+    }
+    return receiptHash;
+}
+
 const tournamentName = (weekId) => `Prime Ethiopia Cup ${weekId + 1}`;
 
 function nextPassStage(stage) {
@@ -54,6 +112,9 @@ const WeeklyTournament = new MySqlModel('tournaments', {
         capacity: DEFAULT_CAPACITY,
         entryFee: 1500,
         prizePool: 20000,
+        prizeTiers: [],
+        type: 'weekly',
+        format: 'knockout',
         slotsReconciled: false,
         status: 'open',
         matches: [],
@@ -139,7 +200,7 @@ async function notifyTelegram(player, message) {
 }
 
 async function linkTelegramUsername(username, chatId) {
-    const normalized = String(username || '').replace(/^@/, '').toLowerCase();
+    const normalized = normalizeTelegramUsername(username);
     if (!/^[a-z0-9_]{5,32}$/.test(normalized) || !/^\d+$/.test(String(chatId))) return false;
     const [rows] = await getPool().execute(
         `SELECT id FROM pgz_players
@@ -150,6 +211,11 @@ async function linkTelegramUsername(username, chatId) {
     if (!rows.length) return false;
     const player = await Player.findById(rows[0].id);
     if (!player) return false;
+    const players = await Player.find({});
+    if (players.some((candidate) => (
+        String(candidate._id) !== String(player._id)
+        && String(candidate.telegramChatId || '') === String(chatId)
+    ))) return false;
     player.telegramChatId = String(chatId);
     await player.save();
     return true;
@@ -189,13 +255,14 @@ function sendDatabaseError(res, error, message) {
     if (error?.code === 'DB_NOT_CONNECTED') {
         return res.status(503).json({ error: 'MySQL is unavailable. Start XAMPP MySQL and try again.' });
     }
-    if ([
+    if (error?.fatal || [
         'ECONNREFUSED',
         'ECONNRESET',
         'ETIMEDOUT',
         'EPIPE',
         'PROTOCOL_CONNECTION_LOST',
         'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR',
+        'PROTOCOL_SEQUENCE_TIMEOUT',
         'ER_SERVER_SHUTDOWN',
     ].includes(error?.code)) {
         return res.status(503).json({ error: 'The database connection was interrupted. Please retry shortly.' });
@@ -341,6 +408,22 @@ async function ensureWeeks() {
             tournament.prizePool = 20000;
             changed = true;
         }
+        if (!TOURNAMENT_TYPES.includes(tournament.type)) {
+            tournament.type = 'weekly';
+            changed = true;
+        }
+        if (!TOURNAMENT_FORMATS.includes(tournament.format)) {
+            tournament.format = 'knockout';
+            changed = true;
+        }
+        const prizeTiers = normalizePrizeTiers(tournament.prizeTiers);
+        if (!prizeTiers) {
+            tournament.prizeTiers = defaultPrizeTiers(tournament.prizePool);
+            changed = true;
+        } else if (JSON.stringify(prizeTiers) !== JSON.stringify(tournament.prizeTiers)) {
+            tournament.prizeTiers = prizeTiers;
+            changed = true;
+        }
         if (changed) {
             await tournament.save();
         }
@@ -348,8 +431,129 @@ async function ensureWeeks() {
     return WeeklyTournament.find({}).sort({ weekId: 1 });
 }
 
+function defaultPrizeTiers(prizePool = 20000) {
+    const first = Math.round(prizePool * 0.5);
+    const second = Math.round(prizePool * 0.25);
+    const third = Math.round(prizePool * 0.15);
+    return [first, second, third, prizePool - first - second - third]
+        .map((amount, index) => ({ rank: index + 1, amount, reward: '' }));
+}
+
+function normalizePrizeTiers(value) {
+    if (!Array.isArray(value) || value.length < 1 || value.length > MAX_PRIZE_TIERS) return null;
+    let total = 0;
+    const tiers = [];
+    for (const [index, tier] of value.entries()) {
+        if (!tier || tier.rank !== index + 1 || !Number.isInteger(tier.amount)
+            || tier.amount < 0 || typeof (tier.reward ?? '') !== 'string'
+            || (tier.reward ?? '').trim().length > 120) return null;
+        total += tier.amount;
+        if (total > MAX_PRIZE_POOL) return null;
+        tiers.push({ rank: tier.rank, amount: tier.amount, reward: (tier.reward || '').trim() });
+    }
+    return tiers;
+}
+
+function parsePrizeDistribution(value, fallbackPool = 20000) {
+    if (value === undefined) {
+        if (!Number.isInteger(fallbackPool) || fallbackPool < 0 || fallbackPool > MAX_PRIZE_POOL) return null;
+        return { prizeTiers: defaultPrizeTiers(fallbackPool), prizePool: fallbackPool };
+    }
+    const prizeTiers = normalizePrizeTiers(value);
+    if (!prizeTiers) return null;
+    return {
+        prizeTiers,
+        prizePool: prizeTiers.reduce((sum, tier) => sum + tier.amount, 0),
+    };
+}
+
 function normalizeContact(contact) {
-    return contact.trim().replace(/[\s()-]/g, '').toLowerCase();
+    const digits = String(contact || '').replace(/\D/g, '');
+    const localMobile = digits.match(/^0([79]\d{8})$/);
+    if (localMobile) return `251${localMobile[1]}`;
+    if (/^251[79]\d{8}$/.test(digits)) return digits;
+    return digits || String(contact || '').trim().toLowerCase();
+}
+
+function isValidContact(contact) {
+    const digits = String(contact || '').replace(/\D/g, '');
+    return /^(?:0[79]\d{8}|251[79]\d{8})$/.test(digits);
+}
+
+function normalizePlayerName(value) {
+    return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function registrationWasEliminated(registration, tournament) {
+    const registrationId = String(registration._id || '');
+    if (!registrationId || registration.paymentStatus !== 'approved') return false;
+    return (tournament?.matches || []).some((match) => (
+        match.status === 'finished'
+        && match.player1Id && match.player2Id
+        && (String(match.player1Id) === registrationId || String(match.player2Id) === registrationId)
+        && match.winnerId
+        && String(match.winnerId) !== registrationId
+    ));
+}
+
+function registrationIsActive(registration, tournament) {
+    return ['pending', 'approved'].includes(registration.paymentStatus)
+        && ACTIVE_TOURNAMENT_STATUSES.includes(tournament?.status)
+        && !registrationWasEliminated(registration, tournament);
+}
+
+function findActiveRegistration(registrations, tournaments) {
+    const tournamentByWeek = new Map(tournaments.map((tournament) => [Number(tournament.weekId), tournament]));
+    return registrations.find((registration) => (
+        registration.registeredForOthers !== true
+        && registrationIsActive(registration, tournamentByWeek.get(Number(registration.weekId)))
+    )) || null;
+}
+
+function registrationIdentityMatches(registration, candidate) {
+    const contactKey = candidate.contact ? normalizeContact(candidate.contact) : '';
+    const nameKey = normalizePlayerName(candidate.playerName);
+    const telegramKey = String(candidate.telegramUsername || '').trim().replace(/^@/, '').toLowerCase();
+    return (candidate.ownsAccount && registration.registeredForOthers !== true
+        && String(registration.playerId || '') === String(candidate.playerId || ''))
+        || (contactKey && normalizeContact(registration.contact) === contactKey)
+        || (nameKey && normalizePlayerName(registration.playerName) === nameKey)
+        || (telegramKey && String(registration.telegramUsername || '').replace(/^@/, '').toLowerCase() === telegramKey);
+}
+
+function findRegistrationIdentityConflict(registrations, candidates, weekId, tournament) {
+    const active = registrations.filter((registration) => (
+        Number(registration.weekId) === Number(weekId)
+        && registrationIsActive(registration, tournament)
+    ));
+    const seenCandidates = [];
+    for (const candidate of candidates) {
+        const contactKey = candidate.contact ? normalizeContact(candidate.contact) : '';
+        const nameKey = normalizePlayerName(candidate.playerName);
+        const telegramKey = String(candidate.telegramUsername || '').trim().replace(/^@/, '').toLowerCase();
+        const duplicate = active.some((registration) => registrationIdentityMatches(registration, candidate))
+            || seenCandidates.some((previous) => (
+            (contactKey && previous.contactKey === contactKey)
+            || (nameKey && previous.nameKey === nameKey)
+            || (telegramKey && previous.telegramKey === telegramKey)
+        ));
+        if (duplicate) return candidate.playerName || candidate.contact || 'player';
+        seenCandidates.push({ contactKey, nameKey, telegramKey });
+    }
+    return null;
+}
+
+function findActiveIdentityConflict(registrations, candidates, requestedWeekId, tournaments) {
+    const tournamentByWeek = new Map(tournaments.map((tournament) => [Number(tournament.weekId), tournament]));
+    for (const candidate of candidates) {
+        const conflict = registrations.find((registration) => (
+            Number(registration.weekId) !== Number(requestedWeekId)
+            && registrationIsActive(registration, tournamentByWeek.get(Number(registration.weekId)))
+            && registrationIdentityMatches(registration, candidate)
+        ));
+        if (conflict) return Number(conflict.weekId);
+    }
+    return null;
 }
 
 async function createPlayerCode() {
@@ -373,8 +577,15 @@ async function createPlayerCode() {
 
 async function ensurePlayer({ contact, displayName, psnId = '', telegramUsername = '' }) {
     const contactKey = normalizeContact(contact);
-    let player = await Player.findOne({ contactKey });
+    let player = await findPlayerByContact(contact);
+    if (telegramUsername && telegramUsernameConflict(await Player.find({}), telegramUsername, player?._id)) {
+        throw Object.assign(new Error('This Telegram username is already linked to another player account.'), { code: 'TELEGRAM_IDENTITY_CONFLICT' });
+    }
     if (player) {
+        if (player.contactKey !== contactKey) {
+            player.contactKey = contactKey;
+            await player.save();
+        }
         if (telegramUsername && player.telegramUsername !== telegramUsername) {
             player.telegramUsername = telegramUsername;
             await player.save();
@@ -394,10 +605,23 @@ async function ensurePlayer({ contact, displayName, psnId = '', telegramUsername
         return player;
     } catch (error) {
         if (!isDuplicateKeyError(error)) throw error;
-        player = await Player.findOne({ contactKey });
+        player = await findPlayerByContact(contact);
         if (player) return player;
         throw error;
     }
+}
+
+async function findPlayerByContact(contact, includePasswordHash = false) {
+    const contactKey = normalizeContact(contact);
+    const exactQuery = Player.findOne({ contactKey });
+    if (includePasswordHash) exactQuery.select('+passwordHash');
+    const exactMatch = await exactQuery;
+    if (exactMatch) return exactMatch;
+
+    const allPlayersQuery = Player.find({});
+    if (includePasswordHash) allPlayersQuery.select('+passwordHash');
+    const players = await allPlayersQuery;
+    return players.find((player) => normalizeContact(player.contact || player.contactKey) === contactKey) || null;
 }
 
 function publicPlayer(player) {
@@ -629,27 +853,15 @@ async function sendChatAttachment(res, pool, chatId, messageId) {
     return res.send(data);
 }
 
-function localDayKey(date) {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-        timeZone: 'Africa/Addis_Ababa',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-    }).formatToParts(date);
-    const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
-    return `${values.year}-${values.month}-${values.day}`;
-}
-
 async function sendMatchDayReminders() {
-    const today = localDayKey(new Date());
+    const now = Date.now();
     const tournaments = await WeeklyTournament.find({ status: { $ne: 'completed' } });
     for (const tournament of tournaments) {
         let changed = false;
         const registrations = await Registration.find({ weekId: tournament.weekId, paymentStatus: 'approved' });
         const registrationsById = new Map(registrations.map((item) => [String(item._id), item]));
         for (const match of tournament.matches || []) {
-            if (!match.scheduledAt || localDayKey(new Date(match.scheduledAt)) !== today
-                || match.reminderSentFor === today || !match.player1Id || !match.player2Id) continue;
+            if (!shouldSendMatchReminder(match, now)) continue;
             const players = [match.player1Id, match.player2Id]
                 .map((id) => registrationsById.get(String(id)))
                 .filter((item) => item?.playerId);
@@ -661,7 +873,7 @@ async function sendMatchDayReminders() {
             const location = match.location ? ` at ${match.location}` : '';
             for (const [index, registration] of players.entries()) {
                 const opponent = players[1 - index];
-                const message = `You have a match today at ${kickoff}${location}${opponent ? ` vs ${opponent.playerName}` : ''}.`;
+                const message = `Your match starts in about 15 minutes at ${kickoff}${location}${opponent ? ` vs ${opponent.playerName}` : ''}.`;
                 await tryCreatePlayerNotification(registration.playerId, {
                     type: 'match_reminder',
                     title: 'Match today',
@@ -670,13 +882,22 @@ async function sendMatchDayReminders() {
                 const player = await Player.findById(registration.playerId);
                 await notifyTelegram(player, message);
             }
-            match.reminderSentFor = today;
+            match.reminderSentFor = new Date(match.scheduledAt).toISOString();
             changed = true;
         }
         if (changed) {
             await tournament.save();
         }
     }
+}
+
+function shouldSendMatchReminder(match, now = Date.now()) {
+    if (!match?.scheduledAt || match.status !== 'pending'
+        || !match.player1Id || !match.player2Id) return false;
+    const scheduledAt = new Date(match.scheduledAt).getTime();
+    if (!Number.isFinite(scheduledAt) || scheduledAt <= now
+        || scheduledAt - now > MATCH_REMINDER_WINDOW_MS) return false;
+    return match.reminderSentFor !== new Date(scheduledAt).toISOString();
 }
 
 function requirePlayer(req, res, next) {
@@ -725,9 +946,10 @@ async function attachPlayerToRegistration(registration) {
 }
 
 async function linkPlayerRegistrations(player) {
+    const playerContactKey = normalizeContact(player.contact || player.contactKey);
     const unlinked = await Registration.find({ playerId: null }).select('_id contact');
     const matchingIds = unlinked
-        .filter((registration) => normalizeContact(registration.contact) === player.contactKey)
+        .filter((registration) => normalizeContact(registration.contact) === playerContactKey)
         .map((registration) => registration._id);
     if (!matchingIds.length) return;
     await Registration.updateMany(
@@ -740,26 +962,57 @@ async function linkPlayerRegistrations(player) {
     );
 }
 
+function activeTournamentWeekIdFrom(registrations, tournaments) {
+    const registeredWeekIds = new Set(registrations
+        .map((registration) => Number(registration.weekId))
+        .filter((weekId) => Number.isInteger(weekId) && weekId >= 0));
+    const eligibleRegistrations = registrations.filter((registration) => (
+        registration.registeredForOthers !== true
+        &&
+        registeredWeekIds.has(Number(registration.weekId))
+        && registrationIsActive(registration, tournaments.find((tournament) => (
+            Number(tournament.weekId) === Number(registration.weekId)
+        )))
+    ));
+    const activeTournament = tournaments.find((tournament) => eligibleRegistrations.some((registration) => (
+        Number(registration.weekId) === Number(tournament.weekId)
+    )));
+    return activeTournament ? Number(activeTournament.weekId) : null;
+}
+
+function hasDifferentActiveTournament(activeWeekId, requestedWeekId) {
+    if (activeWeekId === null || activeWeekId === undefined) return false;
+    const activeId = Number(activeWeekId);
+    const requestedId = Number(requestedWeekId);
+    return Number.isInteger(activeId) && Number.isInteger(requestedId) && activeId !== requestedId;
+}
+
 async function activeTournamentWeekId(playerId) {
     const registrations = await Registration.find({
         playerId,
         paymentStatus: { $in: ['pending', 'approved'] },
         registeredForOthers: { $ne: true },
-    });
-    if (!registrations.length) return null;
-    const tournaments = await WeeklyTournament.find({
-        weekId: { $in: [...new Set(registrations.map((item) => item.weekId))] },
-    }).select('weekId status');
-    return tournaments.find((item) => item.status !== 'completed')?.weekId ?? null;
+    }).select('_id weekId paymentStatus registeredForOthers');
+    const weekIds = [...new Set(registrations
+        .map((registration) => Number(registration.weekId))
+        .filter((weekId) => Number.isInteger(weekId) && weekId >= 0))];
+    if (!weekIds.length) return null;
+    const tournaments = await WeeklyTournament.find({ weekId: { $in: weekIds } }).select('weekId status matches');
+    return activeTournamentWeekIdFrom(registrations, tournaments);
 }
 
 function adminTournament(tournament) {
     const { matches = [], ...details } = tournament.toObject();
+    const prizeTiers = normalizePrizeTiers(details.prizeTiers)
+        || defaultPrizeTiers(details.prizePool ?? 20000);
     delete details.theme;
     return {
         ...details,
         name: tournamentName(details.weekId),
-        prizePool: details.prizePool ?? 20000,
+        prizePool: prizeTiers.reduce((sum, tier) => sum + tier.amount, 0),
+        prizeTiers,
+        type: TOURNAMENT_TYPES.includes(details.type) ? details.type : 'weekly',
+        format: TOURNAMENT_FORMATS.includes(details.format) ? details.format : 'knockout',
         matchesGenerated: matches.length > 0,
         status: tournament.status === 'open' || tournament.status === 'full'
             ? 'upcoming'
@@ -805,7 +1058,8 @@ function advanceMatchWinner(matches, match, winnerId) {
     if (nextMatchReady(next)) advanceMatchWinner(matches, next, next.winnerId);
 }
 
-function generateFixtures(players, random = Math.random) {
+function generateFixtures(players, random = Math.random, format = 'knockout') {
+    if (format === 'league') return generateLeagueFixtures(players);
     const shuffled = [...players];
     for (let index = shuffled.length - 1; index > 0; index -= 1) {
         const swapIndex = Math.floor(random() * (index + 1));
@@ -848,13 +1102,64 @@ function generateFixtures(players, random = Math.random) {
     return matches;
 }
 
-function tournamentStandings(players, matches) {
+function generateLeagueFixtures(players) {
+    if (players.length < 2) return [];
+    const rotation = [...players];
+    if (rotation.length % 2) rotation.push(null);
+    const matches = [];
+    const roundCount = rotation.length - 1;
+    for (let round = 0; round < roundCount; round += 1) {
+        const matchCount = rotation.length / 2;
+        for (let index = 0; index < matchCount; index += 1) {
+            const first = rotation[index];
+            const second = rotation[rotation.length - 1 - index];
+            if (!first && !second) continue;
+            matches.push({
+                matchId: `r${round + 1}m${index + 1}`,
+                round,
+                roundName: `League Round ${round + 1}`,
+                matchNumber: index + 1,
+                player1Id: first?._id || null,
+                player2Id: second?._id || null,
+                player1Ready: true,
+                player2Ready: true,
+                score1: null,
+                score2: null,
+                status: first && second ? 'pending' : 'bye',
+                winnerId: null,
+            });
+        }
+        rotation.splice(1, 0, rotation.pop());
+    }
+    return matches;
+}
+
+async function maybeGenerateClosedTournamentFixtures(tournament) {
+    if (!tournament || tournament.matches?.length
+        || !['live', 'full'].includes(tournament.status)) return false;
+    const pendingCount = await Registration.countDocuments({
+        weekId: tournament.weekId,
+        paymentStatus: 'pending',
+    });
+    if (pendingCount) return false;
+    const approved = await Registration.find({ weekId: tournament.weekId, paymentStatus: 'approved' })
+        .sort({ approvedAt: 1, createdAt: 1 })
+        .limit(tournament.capacity);
+    if (approved.length < 2) return false;
+    for (const entry of approved) await attachPlayerToRegistration(entry);
+    tournament.matches = generateFixtures(approved, Math.random, tournament.format || 'knockout');
+    await WeeklyTournament.save(tournament);
+    return true;
+}
+
+function tournamentStandings(players, matches, format = 'knockout') {
     const finalRound = Math.max(-1, ...matches.map((match) => match.round));
     const stats = new Map(players.map((player) => [String(player._id), {
         player: publicRegistration(player),
         played: 0,
         wins: 0,
         losses: 0,
+        points: 0,
         goalsFor: 0,
         goalsAgainst: 0,
         eliminatedRound: -1,
@@ -875,21 +1180,29 @@ function tournamentStandings(players, matches) {
         second.goalsAgainst += match.score1;
         const winner = stats.get(String(match.winnerId));
         const loser = winner === first ? second : first;
-        if (winner) winner.wins += 1;
+        if (winner) {
+            winner.wins += 1;
+            if (format === 'league') winner.points += 3;
+        }
         loser.losses += 1;
-        loser.eliminatedRound = Math.max(loser.eliminatedRound, match.round);
-        if (match.round === finalRound) {
+        if (format !== 'league') loser.eliminatedRound = Math.max(loser.eliminatedRound, match.round);
+        if (format !== 'league' && match.round === finalRound) {
             if (winner) winner.champion = true;
         }
     }
 
-    return [...stats.values()]
+    const standings = [...stats.values()]
         .sort((left, right) => Number(right.champion) - Number(left.champion)
+            || (format === 'league' ? right.points - left.points : 0)
             || right.eliminatedRound - left.eliminatedRound
             || right.wins - left.wins
             || (right.goalsFor - right.goalsAgainst) - (left.goalsFor - left.goalsAgainst)
             || left.player.playerName.localeCompare(right.player.playerName))
         .map((standing, index) => ({ rank: index + 1, ...standing }));
+    if (format === 'league' && matches.length
+        && matches.every((match) => ['finished', 'bye'].includes(match.status))
+        && standings[0]) standings[0].champion = true;
+    return standings;
 }
 
 function publicMatches(matches, registrations) {
@@ -963,6 +1276,457 @@ function publicBracketPlayer(player) {
     };
 }
 
+async function registerPlayerForTournament({ playerId, weekId, payment, receiptData, sessionPreference = 'any' }) {
+    const parsedWeekId = Number(weekId);
+    if (!['any', 'morning', 'afternoon', 'evening'].includes(sessionPreference)
+        || !PAYMENT_METHODS.includes(payment)
+        || !Number.isInteger(parsedWeekId) || parsedWeekId < 0) {
+        throw Object.assign(new Error('Enter valid payment, tournament, and session details.'), { code: 'REGISTRATION_INPUT_INVALID' });
+    }
+    const receipt = parseRegistrationReceipt(receiptData);
+    if (receipt.error) throw Object.assign(new Error(receipt.error), { code: 'REGISTRATION_RECEIPT_INVALID' });
+
+    let registrationLock = null;
+    let registrationLockName = '';
+    let identityLockAcquired = false;
+    try {
+        await ensureWeeks();
+        const player = await Player.findById(playerId);
+        if (!player) throw Object.assign(new Error('Player account was not found.'), { code: 'PLAYER_NOT_FOUND' });
+        await linkPlayerRegistrations(player);
+        registrationLock = await getPool().getConnection();
+        registrationLockName = `pgz_active_${String(player._id)}`;
+        const [lockRows] = await registrationLock.execute('SELECT GET_LOCK(?, 5) AS acquired', [registrationLockName]);
+        if (Number(lockRows[0]?.acquired) !== 1) {
+            throw Object.assign(new Error('Registration is busy for this account. Please try again.'), { code: 'REGISTRATION_BUSY' });
+        }
+        identityLockAcquired = await acquireRegistrationIdentityLock(registrationLock);
+        if (!identityLockAcquired) {
+            throw Object.assign(new Error('Registration is busy. Please try again shortly.'), { code: 'REGISTRATION_BUSY' });
+        }
+
+        const checkout = await Registration.withTransaction(async (connection) => {
+            const registrations = await Registration.findRows(connection, true);
+            const tournaments = await WeeklyTournament.findRows(connection, true);
+            const week = tournaments.find((tournament) => Number(tournament.weekId) === parsedWeekId);
+            if (!week || !['open', 'full'].includes(week.status) || Number(week.availableSlots) < 1) {
+                throw Object.assign(new Error('This tournament week is not accepting registrations.'), { code: 'REGISTRATION_CLOSED' });
+            }
+            const playerRegistrations = registrations.filter((registration) => (
+                String(registration.playerId || '') === String(player._id)
+            ));
+            const activeRegistration = findActiveRegistration(playerRegistrations, tournaments);
+            if (activeRegistration && Number(activeRegistration.weekId) !== parsedWeekId) {
+                throw Object.assign(new Error('You can only be registered in one tournament at a time. Your current tournament must conclude first.'), {
+                    code: 'ACTIVE_TOURNAMENT_CONFLICT',
+                    activeWeekId: Number(activeRegistration.weekId),
+                });
+            }
+            const candidate = {
+                playerId: player._id,
+                ownsAccount: true,
+                playerName: player.displayName,
+                contact: player.contact,
+                telegramUsername: player.telegramUsername,
+            };
+            const activeIdentityWeekId = findActiveIdentityConflict(registrations, [candidate], parsedWeekId, tournaments);
+            if (activeIdentityWeekId !== null) {
+                throw Object.assign(new Error('You can only be registered in one tournament at a time. Your current tournament must conclude first.'), {
+                    code: 'ACTIVE_TOURNAMENT_CONFLICT',
+                    activeWeekId: activeIdentityWeekId,
+                });
+            }
+            if (findRegistrationIdentityConflict(registrations, [candidate], parsedWeekId, week)) {
+                throw Object.assign(new Error('You are already registered for this active tournament.'), { code: 'REGISTRATION_DUPLICATE' });
+            }
+
+            const entry = Registration.prepare({
+                playerName: player.displayName,
+                contact: player.contact,
+                telegramUsername: player.telegramUsername || '',
+                sessionPreference,
+                playerId: player._id,
+                playerCode: player.playerCode,
+                avatar: player.avatar,
+                slotReserved: true,
+                confirmationCode: `PG-${crypto.randomBytes(5).toString('hex').toUpperCase()}`,
+                weekId: parsedWeekId,
+                payment,
+                receiptData: receipt.data,
+            }, true);
+            await claimPaymentReceipt(connection, receipt, String(entry._id), player._id);
+            week.availableSlots = Number(week.availableSlots) - 1;
+            week.status = week.availableSlots === 0 ? 'full' : 'open';
+            await WeeklyTournament.save(week, connection);
+            await Registration.save(entry, connection);
+            return { entry, week };
+        });
+
+        const weekName = checkout.week.name || tournamentName(parsedWeekId);
+        const notificationWarning = await tryCreatePlayerNotification(player._id, {
+            type: 'registration',
+            title: 'Registration received',
+            message: `Your request for ${weekName} is pending payment approval.`,
+        });
+        return {
+            registration: publicRegistration(checkout.entry),
+            player: publicPlayer(player),
+            tournament: { weekId: parsedWeekId, name: weekName, entryFee: checkout.week.entryFee },
+            ...(notificationWarning ? { notificationWarning } : {}),
+        };
+    } finally {
+        if (registrationLock) {
+            try {
+                if (identityLockAcquired) await registrationLock.execute('SELECT RELEASE_LOCK(?)', [REGISTRATION_IDENTITY_LOCK]);
+                if (registrationLockName) await registrationLock.execute('SELECT RELEASE_LOCK(?)', [registrationLockName]);
+            } catch (error) {
+                console.error('Registration lock release failed:', error?.message || error);
+            } finally {
+                registrationLock.release();
+            }
+        }
+    }
+}
+
+async function registerPlayersForTournament({ playerId, weekId, payment, receiptData, participants }) {
+    const parsedWeekId = Number(weekId);
+    const validParticipants = Array.isArray(participants)
+        && participants.length > 0
+        && participants.length <= CAPACITY
+        && participants.every((participant) => (
+            participant
+            && typeof participant.playerName === 'string'
+            && participant.playerName.trim().length > 0
+            && participant.playerName.trim().length <= 60
+            && isValidContact(participant.contact)
+            && (!participant.telegramUsername || !parseTelegramUsername(participant.telegramUsername).error)
+            && ['any', 'morning', 'afternoon', 'evening'].includes(participant.sessionPreference || 'any')
+        ));
+    if (!PAYMENT_METHODS.includes(payment) || !Number.isInteger(parsedWeekId) || parsedWeekId < 0 || !validParticipants) {
+        throw Object.assign(new Error('Provide valid players, phone numbers, payment method, and tournament.'), { code: 'GROUP_INPUT_INVALID' });
+    }
+    const receipt = parseRegistrationReceipt(receiptData);
+    if (receipt.error) throw Object.assign(new Error(receipt.error), { code: 'REGISTRATION_RECEIPT_INVALID' });
+
+    let lockConnection = null;
+    let playerLockName = '';
+    let identityLockAcquired = false;
+    try {
+        await ensureWeeks();
+        const payer = await Player.findById(playerId);
+        if (!payer) throw Object.assign(new Error('Link your player account before registering others.'), { code: 'PLAYER_NOT_FOUND' });
+        await linkPlayerRegistrations(payer);
+        lockConnection = await getPool().getConnection();
+        playerLockName = `pgz_active_${String(payer._id)}`;
+        const [playerLockRows] = await lockConnection.execute('SELECT GET_LOCK(?, 5) AS acquired', [playerLockName]);
+        if (Number(playerLockRows[0]?.acquired) !== 1) {
+            throw Object.assign(new Error('Registration is busy for this account. Please try again.'), { code: 'REGISTRATION_BUSY' });
+        }
+        identityLockAcquired = await acquireRegistrationIdentityLock(lockConnection);
+        if (!identityLockAcquired) {
+            throw Object.assign(new Error('Registration is busy. Please try again shortly.'), { code: 'REGISTRATION_BUSY' });
+        }
+
+        const groupId = crypto.randomUUID();
+        const checkout = await Registration.withTransaction(async (connection) => {
+            const registrations = await Registration.findRows(connection, true);
+            const tournaments = await WeeklyTournament.findRows(connection, true);
+            const week = tournaments.find((tournament) => Number(tournament.weekId) === parsedWeekId);
+            if (!week || !['open', 'full'].includes(week.status)
+                || Number(week.availableSlots) < participants.length) {
+                throw Object.assign(new Error('This tournament does not have enough open slots for the full group.'), { code: 'GROUP_REGISTRATION_CLOSED' });
+            }
+            const includesPayer = participants.some((participant) => participant.isAccountOwner === true);
+            if (includesPayer) {
+                const activeRegistration = findActiveRegistration(
+                    registrations.filter((entry) => String(entry.playerId || '') === String(payer._id)),
+                    tournaments,
+                );
+                if (activeRegistration && Number(activeRegistration.weekId) !== parsedWeekId) {
+                    throw Object.assign(new Error('You can only be registered in one tournament at a time. Your current tournament must conclude first.'), {
+                        code: 'ACTIVE_TOURNAMENT_CONFLICT',
+                        activeWeekId: Number(activeRegistration.weekId),
+                    });
+                }
+            }
+            const candidates = participants.map((participant) => ({
+                playerId: payer._id,
+                ownsAccount: participant.isAccountOwner === true,
+                playerName: participant.playerName.trim(),
+                contact: participant.contact,
+                telegramUsername: participant.telegramUsername || '',
+            }));
+            const activeIdentityWeekId = findActiveIdentityConflict(registrations, candidates, parsedWeekId, tournaments);
+            if (activeIdentityWeekId !== null) {
+                throw Object.assign(new Error('A player in this group is already active in another tournament.'), {
+                    code: 'ACTIVE_TOURNAMENT_CONFLICT',
+                    activeWeekId: activeIdentityWeekId,
+                });
+            }
+            if (findRegistrationIdentityConflict(registrations, candidates, parsedWeekId, week)) {
+                throw Object.assign(new Error('A player in this group is already registered for this tournament.'), { code: 'REGISTRATION_DUPLICATE' });
+            }
+
+            week.availableSlots = Number(week.availableSlots) - participants.length;
+            week.status = week.availableSlots === 0 ? 'full' : 'open';
+            await WeeklyTournament.save(week, connection);
+            await claimPaymentReceipt(connection, receipt, groupId, payer._id);
+            await connection.execute(
+                `INSERT INTO payment_submissions (group_id, receipt_data, receipt_mime)
+                 VALUES (?, ?, ?)`,
+                [groupId, receipt.buffer, receipt.mime],
+            );
+            const entries = await Registration.insertMany(participants.map((participant) => ({
+                playerName: participant.playerName.trim(),
+                contact: participant.contact,
+                telegramUsername: normalizeTelegramUsername(participant.telegramUsername),
+                playerId: payer._id,
+                playerCode: payer.playerCode,
+                avatar: payer.avatar,
+                slotReserved: true,
+                confirmationCode: `PG-${crypto.randomBytes(5).toString('hex').toUpperCase()}`,
+                weekId: parsedWeekId,
+                payment,
+                paymentGroupId: groupId,
+                registeredForOthers: participant.isAccountOwner !== true,
+                sessionPreference: participant.sessionPreference || 'any',
+                paymentStatus: 'pending',
+                receiptData: '',
+                passToken: '',
+                checkInStatus: 'not_checked_in',
+                readyStatus: 'not_ready',
+            })), { connection });
+            return { entries, week };
+        });
+        const warning = await tryCreatePlayerNotification(payer._id, {
+            type: 'registration',
+            title: 'Registration received',
+            message: `${checkout.entries.length} entries for ${checkout.week.name || tournamentName(parsedWeekId)} are pending payment approval.`,
+        });
+        return {
+            groupId,
+            registrations: checkout.entries.map((entry) => publicRegistration(entry)),
+            tournament: { weekId: parsedWeekId, name: checkout.week.name || tournamentName(parsedWeekId) },
+            ...(warning ? { notificationWarning: warning } : {}),
+        };
+    } finally {
+        if (lockConnection) {
+            try {
+                if (identityLockAcquired) await lockConnection.execute('SELECT RELEASE_LOCK(?)', [REGISTRATION_IDENTITY_LOCK]);
+                if (playerLockName) await lockConnection.execute('SELECT RELEASE_LOCK(?)', [playerLockName]);
+            } catch (error) {
+                console.error('Group registration lock release failed:', error?.message || error);
+            } finally {
+                lockConnection.release();
+            }
+        }
+    }
+}
+
+async function resubmitPlayerPayment({ playerId, registrationId, receiptData, payment }) {
+    if (!isValidObjectId(registrationId)) {
+        throw Object.assign(new Error('Choose a valid rejected registration.'), { code: 'RESUBMIT_INPUT_INVALID' });
+    }
+    if (payment !== undefined && !PAYMENT_METHODS.includes(payment)) {
+        throw Object.assign(new Error('Choose a valid payment method.'), { code: 'RESUBMIT_INPUT_INVALID' });
+    }
+    const receipt = parseRegistrationReceipt(receiptData);
+    if (receipt.error) throw Object.assign(new Error(receipt.error), { code: 'RESUBMIT_INPUT_INVALID' });
+
+    const identityConnection = await getPool().getConnection();
+    let identityLockAcquired = false;
+    try {
+        identityLockAcquired = await acquireRegistrationIdentityLock(identityConnection);
+        if (!identityLockAcquired) {
+            throw Object.assign(new Error('Registration is busy. Please try again shortly.'), { code: 'REGISTRATION_BUSY' });
+        }
+        const result = await Registration.withTransaction(async (connection) => {
+            const registrations = await Registration.findRows(connection, true);
+            const tournaments = await WeeklyTournament.findRows(connection, true);
+            const target = registrations.find((registration) => (
+                String(registration._id) === String(registrationId)
+                && String(registration.playerId) === String(playerId)
+            ));
+            if (!target) throw Object.assign(new Error('Rejected registration was not found.'), { code: 'RESUBMIT_NOT_FOUND' });
+            if (target.paymentStatus !== 'rejected') {
+                throw Object.assign(new Error('Only rejected payments can be resubmitted.'), { code: 'RESUBMIT_CONFLICT' });
+            }
+            const entries = target.paymentGroupId
+                ? registrations.filter((registration) => registration.paymentGroupId === target.paymentGroupId)
+                : [target];
+            if (entries.some((entry) => (
+                String(entry.playerId) !== String(playerId)
+                || entry.paymentStatus !== 'rejected'
+                || Number(entry.weekId) !== Number(target.weekId)
+            ))) {
+                throw Object.assign(new Error('This payment group is no longer eligible for resubmission.'), { code: 'RESUBMIT_CONFLICT' });
+            }
+
+            const weekId = Number(target.weekId);
+            const tournament = tournaments.find((item) => Number(item.weekId) === weekId);
+            if (!tournament || !['open', 'full'].includes(tournament.status)
+                || Number(tournament.availableSlots) < entries.length) {
+                throw Object.assign(new Error('This tournament does not have enough open slots to resubmit the payment.'), { code: 'RESUBMIT_CONFLICT' });
+            }
+            const candidates = entries.map((entry) => ({
+                playerId,
+                ownsAccount: entry.registeredForOthers !== true,
+                playerName: entry.playerName,
+                contact: entry.contact,
+                telegramUsername: entry.telegramUsername,
+            }));
+            const playerRegistrations = registrations.filter((entry) => String(entry.playerId || '') === String(playerId));
+            const activeRegistration = findActiveRegistration(playerRegistrations, tournaments);
+            if ((activeRegistration && Number(activeRegistration.weekId) !== weekId)
+                || findActiveIdentityConflict(registrations, candidates, weekId, tournaments)) {
+                throw Object.assign(new Error('You can only be registered in one tournament at a time. Your current tournament must conclude first.'), { code: 'RESUBMIT_CONFLICT' });
+            }
+            if (findRegistrationIdentityConflict(registrations, candidates, weekId, tournament)) {
+                throw Object.assign(new Error('You are already registered for this active tournament.'), { code: 'RESUBMIT_CONFLICT' });
+            }
+            await claimPaymentReceipt(connection, receipt, registrationReceiptKey(target), playerId);
+
+            tournament.availableSlots = Number(tournament.availableSlots) - entries.length;
+            tournament.status = tournament.availableSlots === 0 ? 'full' : 'open';
+            await WeeklyTournament.save(tournament, connection);
+            if (target.paymentGroupId) {
+                const [submission] = await connection.execute(
+                    `UPDATE payment_submissions
+                     SET receipt_data = ?, receipt_mime = ?, decision = 'pending',
+                         rejection_reason = NULL, reviewed_at = NULL
+                     WHERE group_id = ? AND decision = 'rejected'`,
+                    [receipt.buffer, receipt.mime, target.paymentGroupId],
+                );
+                if (submission.affectedRows !== 1) {
+                    throw Object.assign(new Error('This payment group is no longer eligible for resubmission.'), { code: 'RESUBMIT_CONFLICT' });
+                }
+            }
+            for (const entry of entries) {
+                entry.paymentStatus = 'pending';
+                entry.payment = payment || entry.payment;
+                entry.slotReserved = true;
+                entry.rejectionReason = null;
+                entry.rejectedAt = null;
+                entry.approvedAt = null;
+                entry.passToken = '';
+                if (!target.paymentGroupId) entry.receiptData = receipt.data;
+                await Registration.save(entry, connection);
+            }
+            return entries;
+        });
+        const warning = await tryCreatePlayerNotification(playerId, {
+            type: 'registration',
+            title: 'Payment resubmitted',
+            message: 'Your corrected payment receipt has been sent for review.',
+        });
+        return {
+            registrations: result.map((entry) => publicRegistration(entry, false)),
+            ...(warning ? { notificationWarning: warning } : {}),
+        };
+    } finally {
+        try {
+            if (identityLockAcquired) await identityConnection.execute('SELECT RELEASE_LOCK(?)', [REGISTRATION_IDENTITY_LOCK]);
+        } catch (error) {
+            console.error('Registration identity lock release failed:', error?.message || error);
+        } finally {
+            identityConnection.release();
+        }
+    }
+}
+
+async function findTelegramPlayer(chatId) {
+    if (!/^\d+$/.test(String(chatId || ''))) return null;
+    const player = await Player.findOne({ telegramChatId: String(chatId) });
+    return player ? publicPlayer(player) : null;
+}
+
+async function listTelegramPlayerRegistrations(chatId) {
+    if (!/^\d+$/.test(String(chatId || ''))) return [];
+    const player = await Player.findOne({ telegramChatId: String(chatId) });
+    if (!player) return [];
+    const registrations = await Registration.find({ playerId: player._id }).sort({ createdAt: -1 });
+    const weekIds = [...new Set(registrations.map((entry) => Number(entry.weekId)))];
+    const tournaments = await WeeklyTournament.find({ weekId: { $in: weekIds } }).select('weekId name dateRange');
+    const tournamentByWeek = new Map(tournaments.map((tournament) => [Number(tournament.weekId), tournament]));
+    return registrations.map((entry) => ({
+        ...publicRegistration(entry, false),
+        tournament: tournamentByWeek.get(Number(entry.weekId)) || null,
+    }));
+}
+
+async function registerTelegramPlayer({ chatId, username = '', displayName, contact }) {
+    const telegramChatId = String(chatId || '');
+    const telegramUsername = normalizeTelegramUsername(username);
+    if (!/^\d+$/.test(telegramChatId) || !isValidContact(contact)
+        || typeof displayName !== 'string' || !displayName.trim() || displayName.trim().length > 60
+        || (telegramUsername && !/^[a-z0-9_]{5,32}$/.test(telegramUsername))) {
+        throw Object.assign(new Error('Share your own valid phone number and provide a valid Telegram profile.'), { code: 'TELEGRAM_PROFILE_INVALID' });
+    }
+
+    const connection = await getPool().getConnection();
+    let identityLockAcquired = false;
+    try {
+        identityLockAcquired = await acquireRegistrationIdentityLock(connection);
+        if (!identityLockAcquired) {
+            throw Object.assign(new Error('Player identities are being updated. Please try again.'), { code: 'REGISTRATION_BUSY' });
+        }
+        let player = await Player.findOne({ telegramChatId });
+        if (player && normalizeContact(player.contact) !== normalizeContact(contact)) {
+            throw Object.assign(new Error('This Telegram account is already linked to a different phone number.'), { code: 'TELEGRAM_PROFILE_CONFLICT' });
+        }
+        if (!player) {
+            player = await findPlayerByContact(contact, true);
+            if (player?.telegramChatId && String(player.telegramChatId) !== telegramChatId) {
+                throw Object.assign(new Error('This phone number is linked to another Telegram account.'), { code: 'TELEGRAM_PROFILE_CONFLICT' });
+            }
+        }
+        if (telegramUsernameConflict(await Player.find({}), telegramUsername, player?._id)) {
+            throw Object.assign(new Error('This Telegram username is already linked to another player profile.'), { code: 'TELEGRAM_PROFILE_CONFLICT' });
+        }
+        if (!player) {
+            player = await ensurePlayer({ contact, displayName: displayName.trim(), telegramUsername });
+        }
+        player.telegramChatId = telegramChatId;
+        player.telegramUsername = telegramUsername || player.telegramUsername || '';
+        if (!player.displayName) player.displayName = displayName.trim();
+        await player.save();
+        await linkPlayerRegistrations(player);
+        return publicPlayer(player);
+    } finally {
+        try {
+            if (identityLockAcquired) await connection.execute('SELECT RELEASE_LOCK(?)', [REGISTRATION_IDENTITY_LOCK]);
+        } finally {
+            connection.release();
+        }
+    }
+}
+
+async function listTelegramTournaments() {
+    const weeks = await ensureWeeks();
+    return weeks.filter((week) => (
+        ['open', 'full'].includes(week.status) && Number(week.availableSlots) > 0
+    )).map((week) => ({
+        weekId: Number(week.weekId),
+        name: week.name || tournamentName(week.weekId),
+        dateRange: week.dateRange || '',
+        availableSlots: Number(week.availableSlots),
+        entryFee: Number(week.entryFee || 0),
+    }));
+}
+
+async function getTelegramPaymentAccounts() {
+    await getPool().execute(
+        `INSERT IGNORE INTO payment_accounts (account_type) VALUES ('cbe'), ('telebirr')`,
+    );
+    const [rows] = await getPool().execute(
+        `SELECT account_type AS type, account_name AS name, account_number AS number
+         FROM payment_accounts ORDER BY FIELD(account_type, 'cbe', 'telebirr')`,
+    );
+    return ['cbe', 'telebirr'].map((type) => (
+        rows.find((row) => row.type === type) || { type, name: '', number: '' }
+    ));
+}
+
 function createAdminRouter() {
     const router = express.Router();
 
@@ -1028,27 +1792,38 @@ function createAdminRouter() {
     router.post('/player/register', requireTrustedOrigin, async (req, res) => {
         const { displayName, contact, password, telegramUsername = '' } = req.body || {};
         const normalizedTelegramUsername = typeof telegramUsername === 'string'
-            ? telegramUsername.trim().replace(/^@/, '')
+            ? normalizeTelegramUsername(telegramUsername)
             : '';
         if (typeof displayName !== 'string' || !displayName.trim() || displayName.trim().length > 60
             || typeof contact !== 'string' || !contact.trim() || contact.trim().length > 64
+            || !isValidContact(contact)
             || typeof password !== 'string' || password.length < 8 || password.length > 128
             || typeof telegramUsername !== 'string'
             || (normalizedTelegramUsername && !/^[A-Za-z0-9_]{5,32}$/.test(normalizedTelegramUsername))) {
             return res.status(400).json({ error: 'Enter a player name, valid contact, and password of at least 8 characters.' });
         }
+        let identityLockConnection = null;
+        let identityLockAcquired = false;
         try {
+            identityLockConnection = await getPool().getConnection();
+            identityLockAcquired = await acquireRegistrationIdentityLock(identityLockConnection);
+            if (!identityLockAcquired) {
+                return res.status(503).json({ error: 'Player identity is being updated. Please try again shortly.' });
+            }
             const contactKey = normalizeContact(contact);
-            let player = await Player.findOne({ contactKey }).select('+passwordHash');
+            let player = await findPlayerByContact(contact, true);
             if (player?.passwordHash) {
                 return res.status(409).json({ error: 'An account already exists for this contact. Please sign in.' });
+            }
+            if (telegramUsernameConflict(await Player.find({}), normalizedTelegramUsername, player?._id)) {
+                return res.status(409).json({ error: 'This Telegram username is already linked to another player account.' });
             }
             if (!player) player = await ensurePlayer({ contact, displayName });
             await linkPlayerRegistrations(player);
             const salt = crypto.randomBytes(16).toString('hex');
             const hash = crypto.scryptSync(password, salt, 64).toString('hex');
             player.displayName = displayName.trim();
-            player.telegramUsername = normalizedTelegramUsername.toLowerCase();
+            if (normalizedTelegramUsername) player.telegramUsername = normalizedTelegramUsername.toLowerCase();
             player.passwordHash = `${salt}:${hash}`;
             await player.save();
             await Registration.updateMany(
@@ -1060,7 +1835,22 @@ function createAdminRouter() {
             setPlayerSession(res, token);
             return res.status(201).json({ player: publicPlayer(player), registrations: [] });
         } catch (error) {
+            if (error.code === 'TELEGRAM_IDENTITY_CONFLICT') {
+                return res.status(409).json({ error: error.message });
+            }
             return sendDatabaseError(res, error, 'Player account could not be created.');
+        } finally {
+            if (identityLockConnection) {
+                try {
+                    if (identityLockAcquired) {
+                        await identityLockConnection.execute('SELECT RELEASE_LOCK(?)', [REGISTRATION_IDENTITY_LOCK]);
+                    }
+                } catch (error) {
+                    console.error('Registration identity lock release failed:', error?.message || error);
+                } finally {
+                    identityLockConnection.release();
+                }
+            }
         }
     });
 
@@ -1069,26 +1859,35 @@ function createAdminRouter() {
         if (typeof contact !== 'string' || !contact.trim() || typeof password !== 'string' || !password) {
             return res.status(400).json({ error: 'Enter your contact and password.' });
         }
-        const ip = req.ip;
-        const attempt = playerLoginAttempts.get(ip);
+        if (!isValidContact(contact)) {
+            return res.status(400).json({ error: 'Enter a valid player phone number and password.' });
+        }
+        const attemptKey = `${req.ip}:${normalizeContact(contact)}`;
+        const attempt = playerLoginAttempts.get(attemptKey);
         if (attempt && attempt.blockedUntil > Date.now()) {
             return res.status(429).json({ error: 'Too many sign-in attempts. Try again later.' });
         }
         try {
-            const player = await Player.findOne({ contactKey: normalizeContact(contact) }).select('+passwordHash');
+            const player = await findPlayerByContact(contact, true);
             const [salt, storedHash] = (player?.passwordHash || '').split(':');
+            if (player && (!salt || !storedHash)) {
+                return res.status(409).json({
+                    error: 'Your player profile does not have a web password yet. Choose Create player account to finish setting one up.',
+                });
+            }
             const actualHash = player && salt && storedHash
                 ? crypto.scryptSync(password, salt, 64).toString('hex')
                 : '';
             if (!player || !storedHash || !safeEqual(actualHash, storedHash)) {
                 const failures = (attempt?.failures || 0) + 1;
-                playerLoginAttempts.set(ip, {
+                playerLoginAttempts.set(attemptKey, {
                     failures,
                     blockedUntil: failures >= 5 ? Date.now() + 10 * 60 * 1000 : 0,
                 });
                 return res.status(401).json({ error: 'Invalid player contact or password.' });
             }
-            playerLoginAttempts.delete(ip);
+            playerLoginAttempts.delete(attemptKey);
+            await linkPlayerRegistrations(player);
             const token = crypto.randomBytes(32).toString('hex');
             playerSessions.set(token, { playerId: String(player._id), expiresAt: Date.now() + PLAYER_SESSION_LIFETIME_MS });
             setPlayerSession(res, token);
@@ -1147,24 +1946,19 @@ function createAdminRouter() {
             }
             const weeks = await WeeklyTournament.find({
                 weekId: { $in: [...new Set(registrations.map((item) => item.weekId))] },
-            }).select('weekId name dateRange status').lean();
-            const tournamentByWeek = new Map(weeks.map((week) => [week.weekId, week]));
-            const activeRegistration = registrations.find((registration) => (
-                registration.registeredForOthers !== true
-                &&
-                ['pending', 'approved'].includes(registration.paymentStatus)
-                && tournamentByWeek.get(registration.weekId)?.status !== 'completed'
-            )) || null;
+            }).select('weekId name dateRange status matches').lean();
+            const tournamentByWeek = new Map(weeks.map((week) => [Number(week.weekId), week]));
+            const activeRegistration = findActiveRegistration(registrations, weeks);
             return res.json({
                 authenticated: true,
                 player: publicPlayer(player),
                 activeRegistration: activeRegistration ? {
                     ...publicRegistration(activeRegistration, false),
-                    tournament: tournamentByWeek.get(activeRegistration.weekId) || null,
+                    tournament: tournamentByWeek.get(Number(activeRegistration.weekId)) || null,
                 } : null,
                 registrations: registrations.map((registration) => ({
                     ...publicRegistration(registration, false),
-                    tournament: tournamentByWeek.get(registration.weekId) || null,
+                    tournament: tournamentByWeek.get(Number(registration.weekId)) || null,
                 })),
             });
         } catch (error) {
@@ -1203,6 +1997,24 @@ function createAdminRouter() {
             return res.json({ passCode: `PGZ-PASS:${registration.passToken}` });
         } catch (error) {
             return sendDatabaseError(res, error, 'Digital pass code could not be loaded.');
+        }
+    });
+
+    router.post('/player/registrations/:id/resubmit', requireTrustedOrigin, requirePlayer, async (req, res) => {
+        try {
+            return res.json(await resubmitPlayerPayment({
+                playerId: req.playerId,
+                registrationId: req.params.id,
+                receiptData: req.body?.receiptData,
+                payment: req.body?.payment,
+            }));
+        } catch (error) {
+            if (error.code === 'RESUBMIT_INPUT_INVALID') return res.status(400).json({ error: error.message });
+            if (error.code === 'RESUBMIT_NOT_FOUND') return res.status(404).json({ error: error.message });
+            if (error.code === 'RESUBMIT_CONFLICT') return res.status(409).json({ error: error.message });
+            if (error.code === 'RECEIPT_ALREADY_USED') return res.status(409).json({ error: error.message });
+            if (error.code === 'REGISTRATION_BUSY') return res.status(503).json({ error: error.message });
+            return sendDatabaseError(res, error, 'Payment could not be resubmitted.');
         }
     });
 
@@ -1686,130 +2498,45 @@ function createAdminRouter() {
         }
     });
 
-    router.post('/registrations', async (req, res) => {
-        const {
-            playerName,
-            contact,
-            payment,
-            weekId,
-            receiptData,
-            telegramUsername,
-            sessionPreference = 'any',
-        } = req.body || {};
+    router.post('/registrations', requireTrustedOrigin, requirePlayer, async (req, res) => {
+        const { payment, weekId, receiptData, sessionPreference = 'any' } = req.body || {};
         const parsedWeekId = Number(weekId);
-        const parsedTelegramUsername = parseTelegramUsername(telegramUsername);
-        if (typeof playerName !== 'string' || !playerName.trim() || playerName.length > 60
-            || typeof contact !== 'string' || !contact.trim() || contact.length > 64
-            || parsedTelegramUsername.error
-            || !['any', 'morning', 'afternoon', 'evening'].includes(sessionPreference)
+        if (!['any', 'morning', 'afternoon', 'evening'].includes(sessionPreference)
             || !PAYMENT_METHODS.includes(payment)
             || !Number.isInteger(parsedWeekId) || parsedWeekId < 0) {
-            return res.status(400).json({ error: parsedTelegramUsername.error || 'Enter valid player, contact, payment, and week details.' });
+            return res.status(400).json({ error: 'Enter valid payment, tournament, and session details.' });
         }
-        const receipt = parseRegistrationReceipt(receiptData);
-        if (receipt.error) return res.status(400).json({ error: receipt.error });
-
-        let reservedWeekId = null;
-        let registrationLock = null;
-        let registrationLockName = '';
         try {
-            await ensureWeeks();
-            const player = await ensurePlayer({
-                contact: contact.trim(),
-                displayName: playerName.trim(),
-                telegramUsername: parsedTelegramUsername.username,
-            });
-            await linkPlayerRegistrations(player);
-            registrationLock = await getPool().getConnection();
-            registrationLockName = `pgz_active_${String(player._id)}`;
-            const [lockRows] = await registrationLock.execute(
-                'SELECT GET_LOCK(?, 5) AS acquired',
-                [registrationLockName],
-            );
-            if (Number(lockRows[0]?.acquired) !== 1) {
-                return res.status(503).json({ error: 'Registration is busy for this account. Please try again.' });
-            }
-            const activeWeekId = await activeTournamentWeekId(player._id);
-            if (activeWeekId !== null) {
-                return res.status(409).json({
-                    error: 'You can only be registered in one tournament at a time. Your current tournament must conclude first.',
-                    activeWeekId,
-                });
-            }
-            const duplicate = await Registration.exists({
-                weekId: parsedWeekId,
-                playerId: player._id,
-                paymentStatus: { $in: ['pending', 'approved'] },
-            });
-            if (duplicate) {
-                return res.status(409).json({ error: 'This player already has an active entry for this tournament.' });
-            }
-            const week = await WeeklyTournament.findOneAndUpdate(
-                { weekId: parsedWeekId, status: 'open', availableSlots: { $gt: 0 } },
-                { $inc: { availableSlots: -1 } },
-                { new: true },
-            );
-            if (!week) {
-                return res.status(409).json({ error: 'This tournament week is not accepting registrations.' });
-            }
-            reservedWeekId = parsedWeekId;
-            if (week.availableSlots === 0) {
-                week.status = 'full';
-                await week.save();
-            }
-            const registration = await Registration.create({
-                playerName: playerName.trim(),
-                contact: contact.trim(),
-                telegramUsername: parsedTelegramUsername.username,
-                sessionPreference,
-                playerId: player._id,
-                playerCode: player.playerCode,
-                avatar: player.avatar,
-                slotReserved: true,
-                confirmationCode: `PG-${crypto.randomBytes(5).toString('hex').toUpperCase()}`,
+            const result = await registerPlayerForTournament({
+                playerId: req.playerId,
                 weekId: parsedWeekId,
                 payment,
-                receiptData: receipt.data,
-            });
-            reservedWeekId = null;
-            const weekName = week.name || `Week ${parsedWeekId + 1}`;
-            const notificationWarning = await tryCreatePlayerNotification(player._id, {
-                type: 'registration',
-                title: 'Registration received',
-                message: `Your request for ${weekName} is pending payment approval.`,
+                receiptData,
+                sessionPreference,
             });
             return res.status(201).json({
-                registration: publicRegistration(registration),
-                player: publicPlayer(player),
+                ...result,
                 message: 'Registration request saved. Payment approval is pending.',
-                ...(notificationWarning ? { notificationWarning } : {}),
             });
         } catch (error) {
-            if (reservedWeekId !== null) {
-                try {
-                    await restoreReservedSlot(reservedWeekId);
-                } catch (rollbackError) {
-                    console.error('Registration slot rollback failed:', rollbackError.message);
-                }
+            if (error.code === 'REGISTRATION_INPUT_INVALID' || error.code === 'REGISTRATION_RECEIPT_INVALID') {
+                return res.status(400).json({ error: error.message });
+            }
+            if (error.code === 'PLAYER_NOT_FOUND') return res.status(401).json({ error: 'Player account was not found. Please sign in again.' });
+            if (error.code === 'REGISTRATION_BUSY') return res.status(503).json({ error: error.message });
+            if (error.code === 'REGISTRATION_CLOSED') return res.status(409).json({ error: error.message });
+            if (error.code === 'REGISTRATION_DUPLICATE') return res.status(409).json({ error: error.message });
+            if (error.code === 'RECEIPT_ALREADY_USED') return res.status(409).json({ error: error.message });
+            if (error.code === 'ACTIVE_TOURNAMENT_CONFLICT') {
+                return res.status(409).json({ error: error.message, activeWeekId: error.activeWeekId });
             }
             return sendDatabaseError(res, error, 'Registration could not be saved. Please try again.');
-        } finally {
-            if (registrationLock) {
-                try {
-                    if (registrationLockName) {
-                        await registrationLock.execute('SELECT RELEASE_LOCK(?)', [registrationLockName]);
-                    }
-                } catch (error) {
-                    console.error('Registration lock release failed:', error?.message || error);
-                } finally {
-                    registrationLock.release();
-                }
-            }
         }
     });
 
     router.get('/payment-accounts', async (req, res) => {
         try {
+            res.set('Cache-Control', 'no-store');
             await getPool().execute(
                 `INSERT IGNORE INTO payment_accounts (account_type) VALUES ('cbe'), ('telebirr')`,
             );
@@ -1829,13 +2556,15 @@ function createAdminRouter() {
 
     router.post('/registrations/group', requireTrustedOrigin, requirePlayer, async (req, res) => {
         const { payment, weekId, receiptData, participants, registeredForOthers = false } = req.body || {};
+        const requestedGroupId = req.get('Idempotency-Key') || '';
         const parsedWeekId = Number(weekId);
         const validParticipant = (participant) => participant
             && typeof participant.playerName === 'string'
             && participant.playerName.trim().length > 0
             && participant.playerName.trim().length <= 60
             && (participant.contact === undefined
-                || (typeof participant.contact === 'string' && participant.contact.trim().length <= 64))
+                || (typeof participant.contact === 'string' && participant.contact.trim().length <= 64
+                    && isValidContact(participant.contact)))
             && ['any', 'morning', 'afternoon', 'evening'].includes(participant.sessionPreference || 'any');
         if (!PAYMENT_METHODS.includes(payment) || !Number.isInteger(parsedWeekId) || parsedWeekId < 0
             || !Array.isArray(participants) || participants.length < 1 || participants.length > CAPACITY
@@ -1852,9 +2581,13 @@ function createAdminRouter() {
         }
         const receipt = parseRegistrationReceipt(receiptData);
         if (receipt.error) return res.status(400).json({ error: receipt.error });
+        if (requestedGroupId && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedGroupId)) {
+            return res.status(400).json({ error: 'Registration retry key is invalid. Please submit again.' });
+        }
 
         let lockConnection = null;
         let lockName = '';
+        let identityLockAcquired = false;
         try {
             await ensureWeeks();
             const player = await Player.findById(req.playerId);
@@ -1865,59 +2598,102 @@ function createAdminRouter() {
             if (Number(lockRows[0]?.acquired) !== 1) {
                 return res.status(503).json({ error: 'Registration is busy for this account. Please try again.' });
             }
-            const activeWeekId = registeredForOthers === true ? null : await activeTournamentWeekId(player._id);
-            if (activeWeekId !== null && activeWeekId !== parsedWeekId) {
-                return res.status(409).json({
-                    error: 'You can only be registered in one tournament at a time. Your current tournament must conclude first.',
-                    activeWeekId,
+            identityLockAcquired = await acquireRegistrationIdentityLock(lockConnection);
+            if (!identityLockAcquired) {
+                return res.status(503).json({ error: 'Registration is busy. Please try again shortly.' });
+            }
+            const groupId = requestedGroupId || crypto.randomUUID();
+            const existingEntries = await Registration.find({ paymentGroupId: groupId }).sort({ createdAt: 1 });
+            if (existingEntries.length) {
+                if (existingEntries.some((entry) => String(entry.playerId) !== String(player._id))) {
+                    return res.status(409).json({ error: 'This registration retry key has already been used.' });
+                }
+                const week = await WeeklyTournament.findOne({ weekId: parsedWeekId });
+                if (existingEntries.some((entry) => Number(entry.weekId) !== parsedWeekId)) {
+                    return res.status(409).json({ error: 'This registration retry key belongs to a different tournament.' });
+                }
+                return res.status(201).json({
+                    groupId,
+                    registrations: existingEntries.map((entry) => publicRegistration(entry)),
+                    totalEntryFee: existingEntries.length * Number(week?.entryFee || 0),
+                    message: 'Group registration saved. Payment approval is pending.',
                 });
             }
-            const groupId = crypto.randomUUID();
             const checkout = await Registration.withTransaction(async (connection) => {
+                const registrations = await Registration.findRows(connection, true);
                 const tournaments = await WeeklyTournament.findRows(connection, true);
-                const week = tournaments.find((item) => item.weekId === parsedWeekId);
+                const week = tournaments.find((item) => Number(item.weekId) === parsedWeekId);
                 if (!week || !['open', 'full'].includes(week.status)
                     || Number(week.availableSlots) < participants.length) {
-                    return null;
+                    throw Object.assign(new Error('This tournament does not have enough open slots for the full group.'), { code: 'GROUP_REGISTRATION_CLOSED' });
                 }
+
+                const playerRegistrations = registrations.filter((registration) => (
+                    String(registration.playerId || '') === String(player._id)
+                ));
+                const activeRegistration = registeredForOthers === true
+                    ? null
+                    : findActiveRegistration(playerRegistrations, tournaments);
+                if (activeRegistration && Number(activeRegistration.weekId) !== parsedWeekId) {
+                    throw Object.assign(new Error('You can only be registered in one tournament at a time. Your current tournament must conclude first.'), {
+                        code: 'ACTIVE_TOURNAMENT_CONFLICT',
+                        activeWeekId: Number(activeRegistration.weekId),
+                    });
+                }
+                const candidates = participants.map((participant, index) => ({
+                    playerId: player._id,
+                    ownsAccount: registeredForOthers !== true && index === 0,
+                    playerName: participant.playerName.trim(),
+                    contact: participant.contact?.trim() || player.contact,
+                    telegramUsername: parseTelegramUsername(participant.telegramUsername).username,
+                }));
+                const activeIdentityWeekId = findActiveIdentityConflict(
+                    registrations,
+                    candidates,
+                    parsedWeekId,
+                    tournaments,
+                );
+                if (activeIdentityWeekId !== null) {
+                    throw Object.assign(new Error('You can only be registered in one tournament at a time. Your current tournament must conclude first.'), {
+                        code: 'ACTIVE_TOURNAMENT_CONFLICT',
+                        activeWeekId: activeIdentityWeekId,
+                    });
+                }
+                if (findRegistrationIdentityConflict(registrations, candidates, parsedWeekId, week)) {
+                    throw Object.assign(new Error('You are already registered for this active tournament.'), { code: 'REGISTRATION_DUPLICATE' });
+                }
+
                 week.availableSlots -= participants.length;
                 week.status = week.availableSlots === 0 ? 'full' : 'open';
                 await WeeklyTournament.save(week, connection);
+                await claimPaymentReceipt(connection, receipt, groupId, player._id);
                 await connection.execute(
                     `INSERT INTO payment_submissions (group_id, receipt_data, receipt_mime)
                      VALUES (?, ?, ?)`,
                     [groupId, receipt.buffer, receipt.mime],
                 );
-                const entries = [];
-                for (const participant of participants) {
-                    const entry = Registration.prepare({
-                        playerName: participant.playerName.trim(),
-                        contact: participant.contact?.trim() || player.contact,
-                        telegramUsername: parseTelegramUsername(participant.telegramUsername).username,
-                        playerId: player._id,
-                        playerCode: player.playerCode,
-                        avatar: player.avatar,
-                        slotReserved: true,
-                        confirmationCode: `PG-${crypto.randomBytes(5).toString('hex').toUpperCase()}`,
-                        weekId: parsedWeekId,
-                        payment,
-                        paymentGroupId: groupId,
-                        registeredForOthers: registeredForOthers === true,
-                        sessionPreference: participant.sessionPreference || 'any',
-                        paymentStatus: 'pending',
-                        receiptData: '',
-                        passToken: '',
-                        checkInStatus: 'not_checked_in',
-                        readyStatus: 'not_ready',
-                    }, true);
-                    await Registration.save(entry, connection);
-                    entries.push(entry);
-                }
+                const entries = await Registration.insertMany(participants.map((participant) => ({
+                    playerName: participant.playerName.trim(),
+                    contact: participant.contact?.trim() || player.contact,
+                    telegramUsername: parseTelegramUsername(participant.telegramUsername).username,
+                    playerId: player._id,
+                    playerCode: player.playerCode,
+                    avatar: player.avatar,
+                    slotReserved: true,
+                    confirmationCode: `PG-${crypto.randomBytes(5).toString('hex').toUpperCase()}`,
+                    weekId: parsedWeekId,
+                    payment,
+                    paymentGroupId: groupId,
+                    registeredForOthers: registeredForOthers === true,
+                    sessionPreference: participant.sessionPreference || 'any',
+                    paymentStatus: 'pending',
+                    receiptData: '',
+                    passToken: '',
+                    checkInStatus: 'not_checked_in',
+                    readyStatus: 'not_ready',
+                })), { connection });
                 return { week, entries };
             });
-            if (!checkout) {
-                return res.status(409).json({ error: 'This tournament does not have enough open slots for the full group.' });
-            }
             const registrations = checkout.entries.map((entry) => publicRegistration(entry));
             const notificationWarning = await tryCreatePlayerNotification(player._id, {
                 type: 'registration',
@@ -1932,10 +2708,19 @@ function createAdminRouter() {
                 ...(notificationWarning ? { notificationWarning } : {}),
             });
         } catch (error) {
+            if (error.code === 'GROUP_REGISTRATION_CLOSED') return res.status(409).json({ error: error.message });
+            if (error.code === 'REGISTRATION_DUPLICATE') return res.status(409).json({ error: error.message });
+            if (error.code === 'RECEIPT_ALREADY_USED') return res.status(409).json({ error: error.message });
+            if (error.code === 'ACTIVE_TOURNAMENT_CONFLICT') {
+                return res.status(409).json({ error: error.message, activeWeekId: error.activeWeekId });
+            }
             return sendDatabaseError(res, error, 'Group registration could not be saved. Please try again.');
         } finally {
             if (lockConnection) {
                 try {
+                    if (identityLockAcquired) {
+                        await lockConnection.execute('SELECT RELEASE_LOCK(?)', [REGISTRATION_IDENTITY_LOCK]);
+                    }
                     if (lockName) await lockConnection.execute('SELECT RELEASE_LOCK(?)', [lockName]);
                 } catch (error) {
                     console.error('Registration lock release failed:', error?.message || error);
@@ -2856,11 +3641,22 @@ function createAdminRouter() {
     });
 
     router.post('/admin/tournaments', requireTrustedOrigin, requireAdmin, async (req, res) => {
-        const { dateRange, capacity, entryFee = 1500, prizePool = 20000, status = 'upcoming' } = req.body || {};
+        const {
+            dateRange,
+            capacity,
+            entryFee = 1500,
+            prizePool = 20000,
+            prizeTiers,
+            type = 'weekly',
+            format = 'knockout',
+            status = 'upcoming',
+        } = req.body || {};
+        const distribution = parsePrizeDistribution(prizeTiers, prizePool);
         if (typeof dateRange !== 'string' || !dateRange.trim() || dateRange.trim().length > 40
             || !Number.isInteger(capacity) || capacity < 2 || capacity > CAPACITY
             || !Number.isInteger(entryFee) || entryFee < 0 || entryFee > 1_000_000
-            || !Number.isInteger(prizePool) || prizePool < 0 || prizePool > 10_000_000
+            || !distribution
+            || !TOURNAMENT_TYPES.includes(type) || !TOURNAMENT_FORMATS.includes(format)
             || !ADMIN_STATUSES.includes(status)) {
             return res.status(400).json({ error: `Enter a date, capacity between 2 and ${CAPACITY}, and valid tournament status.` });
         }
@@ -2873,7 +3669,10 @@ function createAdminRouter() {
                 dateRange: dateRange.trim(),
                 capacity,
                 entryFee,
-                prizePool,
+                prizePool: distribution.prizePool,
+                prizeTiers: distribution.prizeTiers,
+                type,
+                format,
                 availableSlots: capacity,
                 slotsReconciled: true,
                 status: status === 'upcoming' ? 'open' : status,
@@ -2887,12 +3686,23 @@ function createAdminRouter() {
 
     router.patch('/admin/tournaments/:weekId', requireTrustedOrigin, requireAdmin, async (req, res) => {
         const weekId = Number(req.params.weekId);
-        const { dateRange, capacity, entryFee = 1500, prizePool = 20000, status } = req.body || {};
+        const {
+            dateRange,
+            capacity,
+            entryFee = 1500,
+            prizePool = 20000,
+            prizeTiers,
+            type = 'weekly',
+            format = 'knockout',
+            status,
+        } = req.body || {};
+        const distribution = parsePrizeDistribution(prizeTiers, prizePool);
         if (!Number.isInteger(weekId) || weekId < 0
             || typeof dateRange !== 'string' || !dateRange.trim() || dateRange.trim().length > 40
             || !Number.isInteger(capacity) || capacity < 2 || capacity > CAPACITY
             || !Number.isInteger(entryFee) || entryFee < 0 || entryFee > 1_000_000
-            || !Number.isInteger(prizePool) || prizePool < 0 || prizePool > 10_000_000
+            || !distribution
+            || !TOURNAMENT_TYPES.includes(type) || !TOURNAMENT_FORMATS.includes(format)
             || !ADMIN_STATUSES.includes(status)) {
             return res.status(400).json({ error: 'Provide valid tournament details and status.' });
         }
@@ -2918,14 +3728,18 @@ function createAdminRouter() {
             tournament.dateRange = dateRange.trim();
             tournament.capacity = capacity;
             tournament.entryFee = entryFee;
-            tournament.prizePool = prizePool;
+            tournament.prizePool = distribution.prizePool;
+            tournament.prizeTiers = distribution.prizeTiers;
+            tournament.type = type;
+            tournament.format = format;
             tournament.availableSlots = availableSlots;
             tournament.slotsReconciled = true;
             tournament.status = status === 'upcoming'
                 ? (tournament.availableSlots === 0 ? 'full' : 'open')
                 : status;
             await tournament.save();
-            return res.json({ tournament: adminTournament(tournament) });
+            const fixturesGenerated = await maybeGenerateClosedTournamentFixtures(tournament);
+            return res.json({ tournament: adminTournament(tournament), fixturesGenerated });
         } catch (error) {
             return sendDatabaseError(res, error, 'Tournament could not be updated.');
         }
@@ -2973,11 +3787,11 @@ function createAdminRouter() {
             if (players.length < 2) {
                 return res.status(409).json({ error: 'At least two approved players are required to generate fixtures.' });
             }
-            tournament.matches = generateFixtures(players);
+            tournament.matches = generateFixtures(players, Math.random, tournament.format || 'knockout');
             await tournament.save();
             return res.status(201).json({
                 matches: publicMatches(tournament.matches, players),
-                standings: tournamentStandings(players, tournament.matches),
+                standings: tournamentStandings(players, tournament.matches, tournament.format || 'knockout'),
             });
         } catch (error) {
             return sendDatabaseError(res, error, 'Fixtures could not be generated.');
@@ -2996,7 +3810,7 @@ function createAdminRouter() {
             for (const player of players) await attachPlayerToRegistration(player);
             return res.json({
                 matches: publicMatches(tournament.matches || [], players),
-                standings: tournamentStandings(players, tournament.matches || []),
+                standings: tournamentStandings(players, tournament.matches || [], tournament.format || 'knockout'),
             });
         } catch (error) {
             return sendDatabaseError(res, error, 'Fixtures could not be loaded.');
@@ -3026,7 +3840,7 @@ function createAdminRouter() {
             const previousScore2 = match.score2;
             const previousScheduledAt = match.scheduledAt || null;
             const previousLocation = match.location || '';
-            const next = tournament.matches.find((item) => item.round === match.round + 1
+            const next = tournament.format === 'league' ? null : tournament.matches.find((item) => item.round === match.round + 1
                 && item.matchNumber === Math.floor((match.matchNumber - 1) / 2) + 1);
             if (previousStatus === 'finished' && status !== 'finished'
                 && next && next.status !== 'pending') {
@@ -3062,7 +3876,7 @@ function createAdminRouter() {
             if (status === 'ongoing' && ['open', 'full'].includes(tournament.status)) {
                 tournament.status = 'live';
             }
-            if (status === 'finished' && (previousStatus !== 'finished' || winnerChanged)) {
+            if (tournament.format !== 'league' && status === 'finished' && (previousStatus !== 'finished' || winnerChanged)) {
                 advanceMatchWinner(tournament.matches, match, winnerId);
             } else if (previousStatus === 'finished' && status !== 'finished' && next) {
                 const isFirstSlot = (match.matchNumber - 1) % 2 === 0;
@@ -3072,7 +3886,10 @@ function createAdminRouter() {
                 next[readyKey] = false;
             }
             const finalRound = Math.max(-1, ...tournament.matches.map((item) => item.round));
-            if (status === 'finished' && match.round === finalRound && !next) {
+            const leagueComplete = tournament.format === 'league'
+                && tournament.matches.every((item) => ['finished', 'bye'].includes(item.status));
+            if ((tournament.format === 'league' && leagueComplete)
+                || (tournament.format !== 'league' && status === 'finished' && match.round === finalRound && !next)) {
                 tournament.status = 'completed';
             }
             await tournament.save();
@@ -3120,7 +3937,7 @@ function createAdminRouter() {
             const notificationWarnings = (await Promise.all(notificationPromises)).filter(Boolean);
             return res.json({
                 matches: publicMatches(tournament.matches, players),
-                standings: tournamentStandings(players, tournament.matches),
+                standings: tournamentStandings(players, tournament.matches, tournament.format || 'knockout'),
                 ...(notificationWarnings.length ? { notificationWarning: notificationWarnings[0] } : {}),
             });
         } catch (error) {
@@ -3160,6 +3977,7 @@ function createAdminRouter() {
 
     router.get('/admin/registrations', requireAdmin, async (req, res) => {
         const filter = {};
+        const summary = req.query.summary === '1';
         if (req.query.week !== undefined) {
             const weekId = Number(req.query.week);
             if (!Number.isInteger(weekId) || weekId < 0) {
@@ -3168,15 +3986,16 @@ function createAdminRouter() {
             filter.weekId = weekId;
         }
         try {
-            const registrations = await Registration.find(filter)
-                .select('+receiptData')
-                .sort({ createdAt: -1 })
-                .limit(500);
-            for (const registration of registrations) await attachPlayerToRegistration(registration);
+            let query = Registration.find(filter);
+            if (!summary) query = query.select('+receiptData');
+            const registrations = await query.sort({ createdAt: -1 }).limit(500);
+            if (!summary) {
+                for (const registration of registrations) await attachPlayerToRegistration(registration);
+            }
             return res.json({
                 registrations: registrations.map((registration) => ({
                     ...publicRegistration(registration, false),
-                    receiptData: registration.receiptData || '',
+                    ...(!summary ? { receiptData: registration.receiptData || '' } : {}),
                 })),
             });
         } catch (error) {
@@ -3361,7 +4180,7 @@ function createAdminRouter() {
                         ));
                     if (approved.length >= tournament.capacity && !tournament.matches.length) {
                         for (const entry of approved) await attachPlayerToRegistration(entry);
-                        tournament.matches = generateFixtures(approved.slice(0, tournament.capacity));
+                        tournament.matches = generateFixtures(approved.slice(0, tournament.capacity), Math.random, tournament.format || 'knockout');
                         fixturesGenerated = true;
                     }
                 }
@@ -3371,7 +4190,9 @@ function createAdminRouter() {
                 return { entries, tournament, fixturesGenerated };
             });
 
-            const { entries, tournament, fixturesGenerated } = transactionResult;
+            const { entries, tournament } = transactionResult;
+            let fixturesGenerated = transactionResult.fixturesGenerated;
+            fixturesGenerated = await maybeGenerateClosedTournamentFixtures(tournament) || fixturesGenerated;
             if (decision === 'approved') {
                 for (const entry of entries) {
                     const account = entry.playerId ? await Player.findById(entry.playerId) : null;
@@ -3496,23 +4317,10 @@ function createAdminRouter() {
                 await restoreReservedSlot(pending.weekId);
             }
             reservedWeekId = null;
-            let fixturesGenerated = false;
-            if (decision === 'approved') {
-                const tournament = await WeeklyTournament.findOne({ weekId: pending.weekId });
-                const approved = await Registration.find({
-                    weekId: pending.weekId,
-                    paymentStatus: 'approved',
-                }).sort({ approvedAt: 1, createdAt: 1 });
-                if (tournament && approved.length >= tournament.capacity && !tournament.matches.length) {
-                    for (const player of approved) await attachPlayerToRegistration(player);
-                    tournament.matches = generateFixtures(approved.slice(0, tournament.capacity));
-                    await tournament.save();
-                    fixturesGenerated = true;
-                }
-            }
+            const tournament = await WeeklyTournament.findOne({ weekId: pending.weekId });
+            const fixturesGenerated = await maybeGenerateClosedTournamentFixtures(tournament);
             let notificationWarning = null;
             if (pending.playerId) {
-                const tournament = await WeeklyTournament.findOne({ weekId: pending.weekId });
                 const tournamentName = tournament?.name || `Week ${pending.weekId + 1}`;
                 notificationWarning = await tryCreatePlayerNotification(pending.playerId, {
                     type: 'registration',
@@ -3552,7 +4360,7 @@ function createAdminRouter() {
         const parsedTelegramUsername = telegramUsername ? parseTelegramUsername(telegramUsername) : { username: '' };
         if (!Number.isInteger(weekId) || weekId < 0
             || typeof playerName !== 'string' || !playerName.trim() || playerName.trim().length > 60
-            || typeof contact !== 'string' || !contact.trim() || contact.trim().length > 64
+            || typeof contact !== 'string' || !contact.trim() || contact.trim().length > 64 || !isValidContact(contact)
             || parsedTelegramUsername.error
             || !PAYMENT_METHODS.includes(payment)) {
             return res.status(400).json({ error: parsedTelegramUsername.error || 'Provide a player name, contact, and valid payment method.' });
@@ -3560,6 +4368,7 @@ function createAdminRouter() {
         let reservedWeekId = null;
         let registrationLock = null;
         let registrationLockName = '';
+        let identityLockAcquired = false;
         try {
             const player = await ensurePlayer({
                 contact: contact.trim(),
@@ -3576,10 +4385,32 @@ function createAdminRouter() {
             if (Number(lockRows[0]?.acquired) !== 1) {
                 return res.status(503).json({ error: 'Registration is busy for this account. Please try again.' });
             }
+            identityLockAcquired = await acquireRegistrationIdentityLock(registrationLock);
+            if (!identityLockAcquired) {
+                return res.status(503).json({ error: 'Registration is busy. Please try again shortly.' });
+            }
             if (await activeTournamentWeekId(player._id) !== null) {
                 return res.status(409).json({
                     error: 'This player is already active in another tournament.',
                 });
+            }
+            const registrations = await Registration.findRows();
+            const tournaments = await WeeklyTournament.findRows();
+            const targetTournament = tournaments.find((item) => Number(item.weekId) === weekId);
+            if (!targetTournament) return res.status(404).json({ error: 'Tournament not found.' });
+            const candidate = {
+                playerId: player._id,
+                ownsAccount: true,
+                playerName: playerName.trim(),
+                contact: player.contact,
+                telegramUsername: parsedTelegramUsername.username,
+            };
+            const activeIdentityWeekId = findActiveIdentityConflict(registrations, [candidate], weekId, tournaments);
+            if (activeIdentityWeekId !== null) {
+                return res.status(409).json({ error: 'This player is already active in another tournament.' });
+            }
+            if (findRegistrationIdentityConflict(registrations, [candidate], weekId, targetTournament)) {
+                return res.status(409).json({ error: 'You are already registered for this active tournament.' });
             }
             const tournament = await WeeklyTournament.findOneAndUpdate(
                 { weekId, status: { $in: ['open', 'full'] }, availableSlots: { $gt: 0 } },
@@ -3609,16 +4440,6 @@ function createAdminRouter() {
                 tournament.status = 'full';
                 await tournament.save();
             }
-            const duplicate = await Registration.exists({
-                weekId,
-                playerId: player._id,
-                paymentStatus: { $in: ['pending', 'approved'] },
-            });
-            if (duplicate) {
-                await restoreReservedSlot(weekId);
-                reservedWeekId = null;
-                return res.status(409).json({ error: 'This player already has an active entry for this tournament.' });
-            }
             const registration = await Registration.create({
                 playerName: playerName.trim(),
                 contact: contact.trim(),
@@ -3643,7 +4464,7 @@ function createAdminRouter() {
             let fixturesGenerated = false;
             if (approved.length >= tournament.capacity && !tournament.matches.length) {
                 for (const entry of approved) await attachPlayerToRegistration(entry);
-                tournament.matches = generateFixtures(approved.slice(0, tournament.capacity));
+                    tournament.matches = generateFixtures(approved.slice(0, tournament.capacity), Math.random, tournament.format || 'knockout');
                 await tournament.save();
                 fixturesGenerated = true;
             }
@@ -3660,6 +4481,9 @@ function createAdminRouter() {
         } finally {
             if (registrationLock) {
                 try {
+                    if (identityLockAcquired) {
+                        await registrationLock.execute('SELECT RELEASE_LOCK(?)', [REGISTRATION_IDENTITY_LOCK]);
+                    }
                     if (registrationLockName) {
                         await registrationLock.execute('SELECT RELEASE_LOCK(?)', [registrationLockName]);
                     }
@@ -3740,12 +4564,35 @@ async function restoreReservedSlot(weekId) {
 }
 
 module.exports = {
+    activeTournamentWeekIdFrom,
     advanceMatchWinner,
     checkInAvailabilityError,
+    claimPaymentReceipt,
     currentPassStage,
     createAdminRouter,
+    defaultPrizeTiers,
     generateFixtures,
+    findActiveRegistration,
+    findActiveIdentityConflict,
+    findTelegramPlayer,
+    listTelegramPlayerRegistrations,
+    getTelegramPaymentAccounts,
+    listTelegramTournaments,
+    isValidContact,
+    findRegistrationIdentityConflict,
+    hasDifferentActiveTournament,
+    normalizeContact,
+    normalizePlayerName,
+    normalizeTelegramUsername,
+    registrationIsActive,
+    registrationWasEliminated,
+    registerPlayerForTournament,
+    registerPlayersForTournament,
+    registerTelegramPlayer,
+    resubmitPlayerPayment,
+    telegramUsernameConflict,
     parseRegistrationReceipt,
+    parsePrizeDistribution,
     parseTelegramUsername,
     scheduledMatchForRegistration,
     linkTelegramUsername,
@@ -3753,7 +4600,9 @@ module.exports = {
     parseChatBackground,
     parseChatMessageInput,
     sendMatchDayReminders,
+    shouldSendMatchReminder,
     setTelegramMessenger,
     setTelegramPassMessenger,
     tournamentStandings,
+    normalizePrizeTiers,
 };

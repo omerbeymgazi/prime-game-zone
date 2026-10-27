@@ -193,3 +193,12 @@ CREATE TABLE IF NOT EXISTS payment_submissions (
     PRIMARY KEY (group_id),
     KEY idx_payment_submissions_decision (decision, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS payment_receipt_claims (
+    receipt_hash CHAR(64) NOT NULL,
+    claim_key VARCHAR(64) NOT NULL,
+    player_id VARCHAR(64) NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (receipt_hash),
+    KEY idx_payment_receipt_claims_owner (claim_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
